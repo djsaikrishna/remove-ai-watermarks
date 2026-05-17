@@ -52,7 +52,10 @@ class InvisibleEngine:
     to break watermark patterns, and reconstructs via reverse diffusion.
     """
 
-    DEFAULT_MODEL_ID = "Lykon/dreamshaper-8"
+    # SDXL base is the default since May 2026: empirically defeats SynthID v2
+    # at strength=0.05 / steps=50 / native ~1024px. See CLAUDE.md "Known
+    # limitations" for the regression evidence ruling out SD-1.5 pipelines.
+    DEFAULT_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
     CTRLREGEN_MODEL_ID = "yepengliu/ctrlregen"
 
     def __init__(
@@ -68,7 +71,8 @@ class InvisibleEngine:
         Args:
             model_id: HuggingFace model ID. None = use default for pipeline.
             device: Device for inference (auto/cpu/mps/cuda). None = auto.
-            pipeline: Pipeline profile ("default" or "ctrlregen").
+            pipeline: Pipeline profile. "default" (SDXL base, defeats SynthID
+                v2) or "ctrlregen" (CtrlRegen).
             hf_token: HuggingFace API token.
             progress_callback: Optional callback for progress messages.
         """
@@ -123,7 +127,9 @@ class InvisibleEngine:
 
         from PIL import Image, ImageOps
 
-        max_dimension = 768
+        # SDXL is trained at 1024px and degrades both quality and watermark-removal
+        # efficacy below that.
+        max_dimension = 1024
         image = Image.open(image_path)
         image = ImageOps.exif_transpose(image)
         orig_size = image.size  # (width, height)

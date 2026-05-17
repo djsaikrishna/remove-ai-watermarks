@@ -60,6 +60,19 @@ AI_KEYWORDS: tuple[str, ...] = (
     "c2pa",
 )
 
+# C2PA UUID used in ISOBMFF (AVIF, HEIF, MP4) ``uuid`` boxes.
+# Reference: https://spec.c2pa.org/specifications/specifications/2.1/specs/C2PA_Specification.html
+C2PA_UUID: bytes = bytes.fromhex("d8fec3d61b0e483c92975828877ec481")
+
+# IPTC ``digitalSourceType`` values (IPTC 2025.1) that flag AI provenance.
+# Used by Instagram, Facebook, X (Twitter) to show "Made with AI" labels.
+IPTC_AI_MARKERS: tuple[bytes, ...] = (
+    b"trainedAlgorithmicMedia",
+    b"compositeSynthetic",
+    b"algorithmicMedia",
+    b"compositeWithTrainedAlgorithmicMedia",
+)
+
 STANDARD_METADATA_KEYS: frozenset[str] = frozenset(
     [
         "Author",
@@ -95,25 +108,38 @@ def has_ai_metadata(image_path: Path) -> bool:
     """
     from PIL import Image
 
-    with Image.open(image_path) as img:
-        for key in img.info:
-            if _is_ai_key(key):
-                return True
+    # PIL may not handle AVIF/HEIF/JPEG-XL without the optional plugins
+    # (ultralytics also monkey-patches Image.open in a way that can raise
+    # ModuleNotFoundError when pi_heif autoload fails), so any open failure
+    # falls through to the binary scan.
+    try:
+        with Image.open(image_path) as img:
+            for key in img.info:
+                if _is_ai_key(key):
+                    return True
+    except Exception as exc:
+        logger.debug("PIL could not open %s for metadata scan: %s", image_path, exc)
 
-    # Check C2PA
+    # Check C2PA — via the official ``c2pa`` lib if available, otherwise via a
+    # binary scan that also catches AVIF/HEIF/JPEG-XL containers (PIL doesn't
+    # expose their metadata uniformly).
     try:
         from c2pa import has_c2pa_metadata
 
         if has_c2pa_metadata(image_path):
             return True
     except ImportError:
-        # Try simple binary scan (read only first 512KB to avoid OOM on huge files)
-        with open(image_path, "rb") as f:
-            data = f.read(512 * 1024)
-        if b"c2pa" in data.lower() or b"C2PA" in data:
-            return True
+        pass
 
-    return False
+    # Binary scan covers C2PA (PNG caBX, JPEG APP11, AVIF/HEIF/JXL uuid boxes)
+    # and IPTC AI markers in XMP. Read only the first 512KB to bound memory.
+    with open(image_path, "rb") as f:
+        data = f.read(512 * 1024)
+    if b"c2pa" in data.lower() or b"C2PA" in data:
+        return True
+    if C2PA_UUID in data:
+        return True
+    return any(marker in data for marker in IPTC_AI_MARKERS)
 
 
 def _scan_png_c2pa_chunk(image_path: Path) -> dict[str, str]:
@@ -243,6 +269,19 @@ def remove_ai_metadata(
 
     if output_path is None:
         output_path = source_path
+
+    # AVIF/HEIF/JPEG-XL: strip C2PA boxes at the container level without
+    # re-encoding. Avoids needing PIL plugins (pillow-heif / pillow-jxl) and
+    # preserves pixel data bit-for-bit.
+    if source_path.suffix.lower() in (".avif", ".heif", ".heic", ".jxl"):
+        from remove_ai_watermarks.noai.isobmff import strip_c2pa_boxes
+
+        data = source_path.read_bytes()
+        cleaned, stripped = strip_c2pa_boxes(data)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(cleaned)
+        logger.info("Stripped %d C2PA box(es) → %s", stripped, output_path)
+        return output_path
 
     # Read image and filter metadata
     with Image.open(source_path) as img:

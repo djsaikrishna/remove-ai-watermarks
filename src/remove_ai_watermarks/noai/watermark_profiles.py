@@ -5,7 +5,7 @@ Pure configuration and lookup functions with no ML dependencies.
 
 from __future__ import annotations
 
-DEFAULT_MODEL_ID = "Lykon/dreamshaper-8"
+DEFAULT_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
 CTRLREGEN_MODEL_ID = "yepengliu/ctrlregen"
 
 LOW_STRENGTH = 0.04

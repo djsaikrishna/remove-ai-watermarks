@@ -197,9 +197,14 @@ def cmd_visible(
 @click.option(
     "-o", "--output", type=click.Path(path_type=Path), default=None, help="Output path (default: <source>_clean.<ext>)."
 )
-@click.option("--strength", type=float, default=0.02, help="Denoising strength (0.0-1.0). Default: 0.02.")
-@click.option("--steps", type=int, default=100, help="Number of denoising steps. Default: 100.")
-@click.option("--pipeline", type=click.Choice(["default", "ctrlregen"]), default="default", help="Pipeline profile.")
+@click.option("--strength", type=float, default=0.05, help="Denoising strength (0.0-1.0). Default: 0.05.")
+@click.option("--steps", type=int, default=50, help="Number of denoising steps. Default: 50.")
+@click.option(
+    "--pipeline",
+    type=click.Choice(["default", "ctrlregen"]),
+    default="default",
+    help="Pipeline profile (default=SDXL, ctrlregen=CtrlRegen).",
+)
 @click.option("--device", type=click.Choice(["auto", "cpu", "mps", "cuda"]), default="auto", help="Inference device.")
 @click.option("--seed", type=int, default=None, help="Random seed for reproducibility.")
 @click.option("--hf-token", type=str, default=None, help="HuggingFace API token.")
@@ -334,13 +339,13 @@ def cmd_metadata(
 @click.option(
     "--inpaint-method", type=click.Choice(["ns", "telea", "gaussian"]), default="ns", help="Inpainting method."
 )
-@click.option("--strength", type=float, default=0.02, help="Invisible watermark denoising strength (0.0-1.0).")
-@click.option("--steps", type=int, default=100, help="Number of denoising steps for invisible removal.")
+@click.option("--strength", type=float, default=0.05, help="Invisible watermark denoising strength (0.0-1.0).")
+@click.option("--steps", type=int, default=50, help="Number of denoising steps for invisible removal.")
 @click.option(
     "--pipeline",
     type=click.Choice(["default", "ctrlregen"]),
     default="default",
-    help="Pipeline profile for invisible removal.",
+    help="Pipeline profile (default=SDXL, ctrlregen=CtrlRegen).",
 )
 @click.option("--model", type=str, default=None, help="HuggingFace model ID for invisible removal.")
 @click.option("--device", type=click.Choice(["auto", "cpu", "mps", "cuda"]), default="auto", help="Inference device.")
@@ -600,7 +605,12 @@ def _process_batch_image(
 @click.option(
     "--humanize", type=float, default=0.0, help="Analog Humanizer film grain intensity (0 = off, typical: 2.0-6.0)."
 )
-@click.option("--pipeline", type=click.Choice(["default", "ctrlregen"]), default="default", help="Pipeline profile.")
+@click.option(
+    "--pipeline",
+    type=click.Choice(["default", "ctrlregen"]),
+    default="default",
+    help="Pipeline profile (default=SDXL, ctrlregen=CtrlRegen).",
+)
 @click.option("--device", type=click.Choice(["auto", "cpu", "mps", "cuda"]), default="auto", help="Inference device.")
 @click.option("--seed", type=int, default=None, help="Random seed for reproducibility.")
 @click.option("--hf-token", type=str, default=None, help="HuggingFace API token.")
@@ -667,7 +677,7 @@ def cmd_batch(
                     seed=seed,
                     hf_token=hf_token,
                     humanize=humanize,
-                )
+                    )
                 processed += 1
 
             except Exception as e:

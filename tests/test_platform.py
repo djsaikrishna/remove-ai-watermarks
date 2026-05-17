@@ -63,7 +63,7 @@ class TestModelProfiles:
     """Tests for watermark_profiles.py."""
 
     def test_default_profile(self):
-        assert get_model_id_for_profile("default") == "Lykon/dreamshaper-8"
+        assert get_model_id_for_profile("default") == "stabilityai/stable-diffusion-xl-base-1.0"
 
     def test_ctrlregen_profile(self):
         assert get_model_id_for_profile("ctrlregen") == "yepengliu/ctrlregen"
@@ -73,7 +73,7 @@ class TestModelProfiles:
             get_model_id_for_profile("nonexistent")
 
     def test_detect_default(self):
-        assert detect_model_profile("Lykon/dreamshaper-8") == "default"
+        assert detect_model_profile("stabilityai/stable-diffusion-xl-base-1.0") == "default"
 
     def test_detect_ctrlregen(self):
         assert detect_model_profile("yepengliu/ctrlregen") == "ctrlregen"

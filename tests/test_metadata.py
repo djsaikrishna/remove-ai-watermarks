@@ -54,6 +54,75 @@ class TestHasAiMetadata:
     def test_clean_image_no_ai(self, tmp_clean_png):
         assert not has_ai_metadata(tmp_clean_png)
 
+    def test_detects_c2pa_uuid_in_isobmff_container(self, tmp_path: Path):
+        """C2PA in AVIF/HEIF/MP4 lives in a ``uuid`` box identified by a fixed UUID.
+
+        Real AVIF/HEIF fixtures aren't shipped, so simulate the container by
+        prepending an ISOBMFF-shaped ftyp box and the C2PA UUID bytes.
+        """
+        from remove_ai_watermarks.metadata import C2PA_UUID
+
+        path = tmp_path / "fake.avif"
+        # ftyp box: size(4) + 'ftyp' + 'avif' + minor_version(4) + 'avif'
+        ftyp = b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1"
+        # uuid box: size(4) + 'uuid' + 16-byte UUID + minimal payload
+        uuid_box = b"\x00\x00\x00\x20uuid" + C2PA_UUID + b"jumb-payload"
+        path.write_bytes(ftyp + uuid_box + b"\x00" * 64)
+        assert has_ai_metadata(path)
+
+    def test_strip_c2pa_boxes_removes_uuid_box(self, tmp_path: Path):
+        """ISOBMFF strip should drop the C2PA uuid box and keep everything else."""
+        from remove_ai_watermarks.metadata import C2PA_UUID
+        from remove_ai_watermarks.noai.isobmff import strip_c2pa_boxes
+
+        ftyp = b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1"
+        # uuid box: size(4) + 'uuid' + 16-byte UUID + minimal payload (8 bytes -> total 32)
+        uuid_box = b"\x00\x00\x00\x20uuid" + C2PA_UUID + b"payload!"
+        mdat = b"\x00\x00\x00\x10mdat" + b"pixeldat"
+        cleaned, stripped = strip_c2pa_boxes(ftyp + uuid_box + mdat)
+        assert stripped == 1
+        assert cleaned == ftyp + mdat
+
+    def test_strip_c2pa_boxes_passthrough_for_non_isobmff(self):
+        """Non-ISOBMFF input must be returned unchanged."""
+        from remove_ai_watermarks.noai.isobmff import strip_c2pa_boxes
+
+        data = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 100
+        cleaned, stripped = strip_c2pa_boxes(data)
+        assert stripped == 0
+        assert cleaned == data
+
+    def test_remove_ai_metadata_strips_c2pa_in_avif(self, tmp_path: Path):
+        """End-to-end: ``remove_ai_metadata`` on a fake .avif drops the C2PA box."""
+        from remove_ai_watermarks.metadata import C2PA_UUID, remove_ai_metadata
+
+        src = tmp_path / "in.avif"
+        ftyp = b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1"
+        uuid_box = b"\x00\x00\x00\x20uuid" + C2PA_UUID + b"payload!"
+        mdat = b"\x00\x00\x00\x10mdat" + b"pixeldat"
+        src.write_bytes(ftyp + uuid_box + mdat)
+
+        out = tmp_path / "out.avif"
+        result = remove_ai_metadata(src, out)
+        assert result == out
+        assert out.read_bytes() == ftyp + mdat
+        # And after stripping, detection must no longer flag the cleaned file.
+        from remove_ai_watermarks.metadata import has_ai_metadata
+
+        assert not has_ai_metadata(out)
+
+    def test_detects_iptc_trained_algorithmic_media_marker(self, tmp_path: Path):
+        """Some pipelines embed only the IPTC AI marker in XMP, no C2PA manifest."""
+        path = tmp_path / "fake.jpg"
+        # Minimal JPEG-ish bytes containing the IPTC AI marker in an XMP-like blob.
+        xmp = (
+            b"<x:xmpmeta><Iptc4xmpExt:DigitalSourceType>"
+            b"trainedAlgorithmicMedia"
+            b"</Iptc4xmpExt:DigitalSourceType></x:xmpmeta>"
+        )
+        path.write_bytes(b"\xff\xd8\xff\xe1" + xmp + b"\xff\xd9")
+        assert has_ai_metadata(path)
+
 
 class TestGetAiMetadata:
     """Tests for extracting AI metadata."""
