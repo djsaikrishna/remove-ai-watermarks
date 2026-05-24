@@ -198,15 +198,21 @@ def get_ai_metadata(image_path: Path) -> dict[str, str]:
 
     result: dict[str, str] = {}
 
-    with Image.open(image_path) as img:
-        for key, value in img.info.items():
-            if _is_ai_key(key):
-                if isinstance(value, bytes):
-                    result[key] = f"<binary {len(value)} bytes>"
-                elif isinstance(value, str) and len(value) > 200:
-                    result[key] = value[:200] + "…"
-                else:
-                    result[key] = str(value)
+    # PIL may not open AVIF/HEIF/JPEG-XL without optional plugins (and
+    # ultralytics' Image.open patch can raise ModuleNotFoundError); fall through
+    # to the C2PA/binary path on any open failure. See CLAUDE.md.
+    try:
+        with Image.open(image_path) as img:
+            for key, value in img.info.items():
+                if _is_ai_key(key):
+                    if isinstance(value, bytes):
+                        result[key] = f"<binary {len(value)} bytes>"
+                    elif isinstance(value, str) and len(value) > 200:
+                        result[key] = value[:200] + "…"
+                    else:
+                        result[key] = str(value)
+    except Exception as exc:
+        logger.debug("PIL could not open %s for AI-metadata scan: %s", image_path, exc)
 
     # C2PA manifest fields from the single canonical parser (noai/c2pa.py).
     c2pa = extract_c2pa_info(image_path)

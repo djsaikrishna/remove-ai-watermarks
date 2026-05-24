@@ -159,6 +159,13 @@ class TestGetAiMetadata:
         assert meta["parameters"].endswith("…")
         assert len(meta["parameters"]) <= 205
 
+    def test_unopenable_file_does_not_raise(self, tmp_path: Path):
+        # PIL can't open HEIC without pillow-heif; get_ai_metadata must fall
+        # through to the binary scan, not propagate UnidentifiedImageError.
+        path = tmp_path / "iphone.heic"
+        path.write_bytes(b"\x00\x00\x00\x18ftypheic" + b"\x00" * 64)
+        assert get_ai_metadata(path) == {}
+
 
 @pytest.mark.skipif(not SAMPLES_DIR.exists(), reason="data/samples not present")
 class TestGetAiMetadataRealSample:
