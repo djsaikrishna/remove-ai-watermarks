@@ -19,6 +19,8 @@ import csv
 import hashlib
 import logging
 import shutil
+import subprocess
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,6 +75,30 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _dims_via_sips(path: Path) -> tuple[int, int]:
+    """Read pixel dimensions via macOS ``sips`` (handles HEIC, which PIL can't
+    open without pillow-heif). Returns (0, 0) off macOS or on failure."""
+    sips = shutil.which("sips")
+    if sys.platform != "darwin" or not sips:
+        return 0, 0
+    try:
+        # Fixed command; the only variable is a local file path passed to ingest.
+        out = subprocess.run(  # noqa: S603
+            [sips, "-g", "pixelWidth", "-g", "pixelHeight", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout
+        dims = {"pixelWidth": 0, "pixelHeight": 0}
+        for line in out.splitlines():
+            for key in dims:
+                if f"{key}:" in line:
+                    dims[key] = int(line.split(":")[1].strip())
+        return dims["pixelWidth"], dims["pixelHeight"]
+    except Exception:  # sips missing/odd output; dims stay unknown
+        return 0, 0
+
+
 def _probe(path: Path) -> tuple[int, int, str, str, bool]:
     """Return (width, height, format, c2pa_issuer, synthid_metadata)."""
     width = height = 0
@@ -83,6 +109,9 @@ def _probe(path: Path) -> tuple[int, int, str, str, bool]:
             fmt = (img.format or fmt).lower()
     except Exception as exc:  # unknown/user formats can raise non-OSError; see CLAUDE.md
         log.debug("PIL could not open %s: %s", path, exc)
+
+    if width == 0:  # e.g. HEIC from iPhone — fall back to macOS sips
+        width, height = _dims_via_sips(path)
 
     info = extract_c2pa_info(path)
     issuer = str(info.get("issuer", ""))
