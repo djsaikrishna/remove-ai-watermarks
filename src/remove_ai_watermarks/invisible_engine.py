@@ -107,6 +107,7 @@ class InvisibleEngine:
         seed: int | None = None,
         humanize: float = 0.0,
         protect_faces: bool = True,
+        max_resolution: int = 0,
     ) -> Path:
         """Remove invisible watermark from an image.
 
@@ -119,6 +120,11 @@ class InvisibleEngine:
             seed: Random seed for reproducibility.
             humanize: Intensity of Analog Humanizer film grain (0 = off).
             protect_faces: Boolean to extract and restore faces intact.
+            max_resolution: Cap the long side (px) before diffusion. 0 (default)
+                = native resolution, no pre-downscale -- matches the hosted
+                raiw.cc backend. Set a positive value only to bound GPU/MPS
+                memory on very large inputs (it reintroduces a lossy
+                downscale->upscale round-trip).
 
         Returns:
             Path to the cleaned image.
@@ -127,22 +133,25 @@ class InvisibleEngine:
 
         from PIL import Image, ImageOps
 
-        # SDXL is trained at 1024px and degrades both quality and watermark-removal
-        # efficacy below that.
-        max_dimension = 1024
+        # Process at native resolution by default (max_resolution=0). The hosted
+        # raiw.cc backend (fal fast-sdxl) does NO pre-downscale either, and at
+        # strength ~0.05 SDXL img2img does not need the input shrunk to ~1024 --
+        # the old forced downscale->upscale round-trip was the main quality loss
+        # (see issue #10). A positive max_resolution caps the long side only to
+        # bound GPU/MPS memory on very large inputs.
         image = Image.open(image_path)
         image = ImageOps.exif_transpose(image)
         orig_size = image.size  # (width, height)
         _tmp_path = None
 
-        if max(image.width, image.height) > max_dimension:
-            ratio = max_dimension / max(image.width, image.height)
+        if max_resolution > 0 and max(image.width, image.height) > max_resolution:
+            ratio = max_resolution / max(image.width, image.height)
             new_size = (int(image.width * ratio), int(image.height * ratio))
             if self._progress_callback:
                 self._progress_callback(
                     f"Downscaling {image.width}x{image.height} "
                     f"to {new_size[0]}x{new_size[1]} "
-                    f"(model trained at {max_dimension}px)..."
+                    f"(max-resolution cap {max_resolution}px)..."
                 )
             image = image.resize(new_size, Image.Resampling.LANCZOS)
 

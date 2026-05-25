@@ -278,6 +278,12 @@ def cmd_visible(
 @click.option(
     "--humanize", type=float, default=0.0, help="Analog Humanizer film grain intensity (0 = off, typical: 2.0-6.0)."
 )
+@click.option(
+    "--max-resolution",
+    type=int,
+    default=0,
+    help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
+)
 @click.pass_context
 def cmd_invisible(
     ctx: click.Context,
@@ -290,6 +296,7 @@ def cmd_invisible(
     seed: int | None,
     hf_token: str | None,
     humanize: float,
+    max_resolution: int,
 ) -> None:
     """Remove invisible AI watermarks (SynthID, StableSignature, TreeRing).
 
@@ -336,6 +343,7 @@ def cmd_invisible(
         guidance_scale=None,
         seed=seed,
         humanize=humanize,
+        max_resolution=max_resolution,
     )
     elapsed = time.monotonic() - t0
 
@@ -476,6 +484,12 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
 @click.option(
     "--humanize", type=float, default=0.0, help="Analog Humanizer film grain intensity (0 = off, typical: 2.0-6.0)."
 )
+@click.option(
+    "--max-resolution",
+    type=int,
+    default=0,
+    help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
+)
 @click.pass_context
 def cmd_all(
     ctx: click.Context,
@@ -491,6 +505,7 @@ def cmd_all(
     seed: int | None,
     hf_token: str | None,
     humanize: float,
+    max_resolution: int,
 ) -> None:
     """Remove ALL watermarks: visible + invisible + metadata.
 
@@ -582,6 +597,7 @@ def cmd_all(
                 num_inference_steps=steps,
                 seed=seed,
                 humanize=humanize,
+                max_resolution=max_resolution,
             )
             console.print("    [green]✓[/] Invisible watermark removed")
 
@@ -633,6 +649,7 @@ def _process_batch_image(
     seed: int | None,
     hf_token: str | None,
     humanize: float,
+    max_resolution: int = 0,
 ) -> None:
     """Process a single image for batch mode.
 
@@ -695,6 +712,7 @@ def _process_batch_image(
                 num_inference_steps=steps,
                 seed=seed,
                 humanize=humanize,
+                max_resolution=max_resolution,
             )
 
     if mode in ("metadata", "all"):
@@ -737,6 +755,12 @@ def _process_batch_image(
 @click.option("--device", type=click.Choice(["auto", "cpu", "mps", "cuda"]), default="auto", help="Inference device.")
 @click.option("--seed", type=int, default=None, help="Random seed for reproducibility.")
 @click.option("--hf-token", type=str, default=None, help="HuggingFace API token.")
+@click.option(
+    "--max-resolution",
+    type=int,
+    default=0,
+    help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
+)
 @click.pass_context
 def cmd_batch(
     ctx: click.Context,
@@ -751,6 +775,7 @@ def cmd_batch(
     hf_token: str | None,
     inpaint: bool,
     humanize: float,
+    max_resolution: int,
 ) -> None:
     """Process all images in a directory."""
     _banner()
@@ -800,6 +825,7 @@ def cmd_batch(
                     seed=seed,
                     hf_token=hf_token,
                     humanize=humanize,
+                    max_resolution=max_resolution,
                 )
                 processed += 1
 
