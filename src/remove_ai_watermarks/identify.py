@@ -165,12 +165,24 @@ def _device_platform(head: bytes) -> str | None:
     return None
 
 
-def _attribute_platform(issuers: list[str]) -> str | None:
-    """Map a set of C2PA issuer names to a human-readable generating platform."""
+def _attribute_platform(issuers: list[str], *, is_ai: bool = True) -> str | None:
+    """Map a set of C2PA issuer names to a human-readable generating platform.
+
+    A specific AI-generator platform (Adobe Firefly, OpenAI, ...) is named only
+    when the content is actually AI (``is_ai``, i.e. digital-source-type
+    ``trainedAlgorithmicMedia``). Otherwise an issuer-name byte match is likely
+    incidental -- e.g. an "Adobe XMP" toolkit string in a Canon/Sony camera
+    capture, or a "Google" cert org -- so we fall back to a neutral signer label
+    rather than mislabel a camera photo as "Adobe Firefly". Real Firefly/OpenAI/
+    Google AI output carries the AI source-type, so it is unaffected. ``is_ai``
+    defaults True so the issuer->platform mapping can still be unit-tested in
+    isolation; ``identify`` passes the file's actual ``c2pa_is_ai``.
+    """
     joined = " ".join(issuers)
-    for needle, platform in _ISSUER_PLATFORM:
-        if needle in joined:
-            return platform
+    if is_ai:
+        for needle, platform in _ISSUER_PLATFORM:
+            if needle in joined:
+                return platform
     if issuers:  # e.g. Truepic alone -- a signing authority, not a generator
         return f"C2PA signer: {', '.join(issuers)} (no known AI generator named)"
     return None
@@ -259,7 +271,7 @@ def identify(image_path: Path, *, check_visible: bool = True, check_invisible: b
     # signer/producer), with the issuer byte-scan only as fallback. The issuer
     # scan alone mis-attributed real samples (Leica->Truepic timestamp authority,
     # Nikon->Adobe namespace, Pixel->Google Gemini) -- the device scan fixes that.
-    platform = (_device_platform(head) or _attribute_platform(issuers)) if has_c2pa else None
+    platform = (_device_platform(head) or _attribute_platform(issuers, is_ai=c2pa_is_ai)) if has_c2pa else None
     if has_c2pa:
         detail = ", ".join(filter(None, [", ".join(issuers), generator, info.get("source_type")]))
         signals.append(Signal("c2pa", detail or "C2PA manifest present", "high"))

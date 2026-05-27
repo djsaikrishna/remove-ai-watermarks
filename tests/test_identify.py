@@ -369,6 +369,18 @@ class TestIdentifyC2paDevice:
         r = identify(p, check_visible=False, check_invisible=False)
         assert r.platform == "Sony (camera, C2PA capture)"
 
+    def test_unmapped_device_not_mislabeled_via_incidental_issuer(self, tmp_path: Path):
+        # An unmapped camera (Canon) whose manifest incidentally contains the
+        # "Adobe" XMP-toolkit string, with NO AI source type, must NOT be labeled
+        # "Adobe Firefly". The issuer->generator mapping only applies to AI content.
+        blob = b"\xff\xd8\xff\xe1 c2pa.claim jumbf Canon EOS Adobe XMP Core \xff\xd9"
+        p = tmp_path / "canon_like.jpg"
+        p.write_bytes(blob)
+        r = identify(p, check_visible=False, check_invisible=False)
+        assert r.is_ai_generated is None  # camera capture, not AI
+        assert r.platform is not None
+        assert "Firefly" not in r.platform  # not mislabeled as an AI generator
+
 
 # ── Open invisible watermark (SD/SDXL/FLUX) integration ─────────────
 
