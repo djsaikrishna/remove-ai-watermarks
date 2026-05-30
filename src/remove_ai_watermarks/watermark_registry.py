@@ -71,8 +71,10 @@ class KnownMark:
         inpaint_strength: float = 0.85,
         force: bool = False,
     ) -> tuple[NDArray[Any], Region | None]:
-        """Remove this mark by reverse-alpha; returns ``(result, cleared_region)``
-        (region for clearing alpha on save, or None if nothing was removed).
+        """Remove this mark by reverse-alpha; returns ``(result, region)`` where
+        ``region`` is the removed mark's bbox (for residual-inpaint positioning),
+        or None if nothing was removed. NB: the CLI does NOT use ``region`` to
+        clear alpha on save -- that zeroing caused the issue-#30 white box.
 
         ``inpaint`` / ``inpaint_strength`` / ``inpaint_method`` tune the Gemini
         reverse-alpha edge-residual cleanup only. ``force`` removes at the mark's

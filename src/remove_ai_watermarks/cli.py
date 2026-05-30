@@ -101,15 +101,15 @@ def _write_bgr_with_alpha(
     path: Path,
     bgr: NDArray[Any],
     alpha: NDArray[Any] | None,
-    clear_region: tuple[int, int, int, int] | None = None,
-    pad: int = 6,
 ) -> None:
     """Write BGR (with optional alpha) to ``path``.
 
-    When ``alpha`` is provided and the output extension supports it, writes a
-    4-channel image. If ``clear_region`` is given as ``(x, y, w, h)``, alpha is
-    forced to 0 inside that bbox (expanded by ``pad`` px) so the watermark area
-    becomes fully transparent in the saved file.
+    When ``alpha`` is provided and the output extension supports it, the original
+    alpha plane is rejoined unchanged. The watermark region is NOT made
+    transparent: reverse-alpha (and inpaint) recover real pixels there, so
+    zeroing alpha would punch a transparent hole that renders as a white box on
+    any non-transparent viewer (issue #30). Preserving the input alpha keeps
+    genuinely transparent backgrounds intact without inventing new holes.
     """
     import numpy as np
 
@@ -119,17 +119,7 @@ def _write_bgr_with_alpha(
         image_io.imwrite(path, bgr)
         return
 
-    alpha_out = alpha
-    if clear_region is not None:
-        alpha_out = alpha.copy()
-        x, y, w, h = clear_region
-        height, width = alpha.shape[:2]
-        x0, y0 = max(0, x - pad), max(0, y - pad)
-        x1, y1 = min(width, x + w + pad), min(height, y + h + pad)
-        if x1 > x0 and y1 > y0:
-            alpha_out[y0:y1, x0:x1] = 0
-
-    bgra = np.dstack([bgr, alpha_out])
+    bgra = np.dstack([bgr, alpha])
     image_io.imwrite(path, bgra)
 
 
@@ -246,7 +236,7 @@ def cmd_visible(
     method: Literal["telea", "ns"] = "ns" if inpaint_method == "ns" else "telea"
     t0 = time.monotonic()
     with console.status(f"[cyan]Removing {chosen.label}… ({chosen.recovery})[/]"):
-        result, region = chosen.remove(
+        result, _ = chosen.remove(
             image,
             inpaint_method=method,
             inpaint=inpaint,
@@ -255,9 +245,9 @@ def cmd_visible(
         )
     elapsed = time.monotonic() - t0
 
-    # Save (preserves transparency by clearing alpha in the watermark region)
+    # Save (rejoins the original alpha plane unchanged)
     output.parent.mkdir(parents=True, exist_ok=True)
-    _write_bgr_with_alpha(output, result, alpha, clear_region=region)
+    _write_bgr_with_alpha(output, result, alpha)
 
     # Strip metadata
     if strip_metadata:
@@ -349,8 +339,7 @@ def cmd_erase(
     elapsed = time.monotonic() - t0
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    clear = boxes[0] if len(boxes) == 1 else None
-    _write_bgr_with_alpha(output, result, alpha, clear_region=clear)
+    _write_bgr_with_alpha(output, result, alpha)
 
     if strip_metadata:
         try:
@@ -695,7 +684,6 @@ def cmd_all(
         h, w = image.shape[:2]
         console.print(f"    [dim]Input:[/] {source.name}  ({w}x{h})")
 
-        region: tuple[int, int, int, int] | None = None
         with console.status("[cyan]Removing visible watermark…[/]"):
             det = engine.detect_watermark(image)
             if det.detected:
@@ -709,7 +697,7 @@ def cmd_all(
                 console.print("    [dim]Skipped (no visible watermark detected)[/]")
 
         # Save to temp file for invisible engine input (preserve alpha if present)
-        _write_bgr_with_alpha(tmp_path, result, alpha, clear_region=region)
+        _write_bgr_with_alpha(tmp_path, result, alpha)
 
         # ── Step 2: Invisible watermark ──────────────────────────────
         console.print("\n  [bold cyan]② Invisible watermark removal[/]")
@@ -761,14 +749,14 @@ def cmd_all(
 
         # ── Write final result ────────────────────────────────────────
         # The invisible step (and downstream cv2.IMREAD_COLOR paths) drops alpha,
-        # so re-attach the original alpha (with the watermark region cleared)
-        # when writing the final output for transparent formats.
+        # so re-attach the original alpha plane unchanged when writing the final
+        # output for transparent formats.
         output.parent.mkdir(parents=True, exist_ok=True)
         final_bgr, _ = _read_bgr_and_alpha(tmp_path)
         if final_bgr is None:
             console.print(f"[red]Error:[/] Failed to read intermediate file: {tmp_path}")
             raise SystemExit(1)
-        _write_bgr_with_alpha(output, final_bgr, alpha, clear_region=region)
+        _write_bgr_with_alpha(output, final_bgr, alpha)
 
     finally:
         # Clean up temp file if it still exists
@@ -808,7 +796,6 @@ def _process_batch_image(
         ValueError: If the image cannot be opened.
     """
     saved_alpha: NDArray[Any] | None = None
-    saved_region: tuple[int, int, int, int] | None = None
 
     if mode in ("visible", "all"):
         from remove_ai_watermarks.gemini_engine import GeminiEngine
@@ -823,7 +810,6 @@ def _process_batch_image(
         if image is None:
             raise ValueError("Failed to read image")
 
-        region: tuple[int, int, int, int] | None = None
         det = engine.detect_watermark(image)
         if det.detected:
             result = engine.remove_watermark(image)
@@ -834,9 +820,8 @@ def _process_batch_image(
         else:
             result = image.copy()
 
-        _write_bgr_with_alpha(out_path, result, alpha, clear_region=region)
+        _write_bgr_with_alpha(out_path, result, alpha)
         saved_alpha = alpha
-        saved_region = region
 
     if mode in ("invisible", "all"):
         from remove_ai_watermarks.invisible_engine import (
@@ -873,7 +858,7 @@ def _process_batch_image(
     if mode == "all" and saved_alpha is not None:
         final_bgr, _ = _read_bgr_and_alpha(out_path)
         if final_bgr is not None:
-            _write_bgr_with_alpha(out_path, final_bgr, saved_alpha, clear_region=saved_region)
+            _write_bgr_with_alpha(out_path, final_bgr, saved_alpha)
 
 
 @main.command("batch")

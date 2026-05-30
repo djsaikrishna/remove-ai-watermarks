@@ -198,15 +198,17 @@ class TestVisibleCommand:
         # which doesn't overlap the centre square at 200x200).
         assert out[100, 100, 3] == 255
 
-    def test_visible_clears_alpha_in_watermark_region(self, runner, tmp_path):
-        """When inpainting an RGBA image, the watermark region must be cleared
-        in the alpha channel so the sparkle area becomes transparent, not opaque-black.
+    def test_visible_keeps_alpha_opaque_in_watermark_region(self, runner, tmp_path):
+        """Regression for issue #30 (white box): on an opaque RGBA image, the
+        watermark region must stay OPAQUE. Reverse-alpha recovers real pixels
+        there, so zeroing alpha would punch a transparent hole that renders as a
+        solid white box on any non-transparent viewer.
         """
         rgba = np.full((200, 200, 4), 255, dtype=np.uint8)  # fully opaque white
         src = tmp_path / "rgba_full.png"
         cv2.imwrite(str(src), rgba)
 
-        output = tmp_path / "rgba_cleared.png"
+        output = tmp_path / "rgba_kept.png"
         result = runner.invoke(
             main,
             ["visible", str(src), "-o", str(output), "--no-detect"],
@@ -215,13 +217,15 @@ class TestVisibleCommand:
         assert result.exit_code == 0, result.output
         out = cv2.imread(str(output), cv2.IMREAD_UNCHANGED)
         assert out.shape[2] == 4
-        # Default sparkle position is in the bottom-right; alpha there must be 0.
+        # Default sparkle position is in the bottom-right; alpha there must stay 255.
         from remove_ai_watermarks.gemini_engine import get_watermark_config
 
         cfg = get_watermark_config(200, 200)
         px, py = cfg.get_position(200, 200)
         size = cfg.logo_size
-        assert out[py + size // 2, px + size // 2, 3] == 0, "alpha in the watermark region was not cleared"
+        assert out[py + size // 2, px + size // 2, 3] == 255, "watermark region alpha was zeroed (white-box regression)"
+        # No pixel anywhere should have been forced transparent.
+        assert int((out[:, :, 3] == 0).sum()) == 0, "spurious transparent pixels introduced"
 
     def test_visible_rgb_input_stays_rgb(self, runner, sample_png, tmp_path):
         """Regression: a plain RGB PNG must NOT gain a spurious alpha channel."""
