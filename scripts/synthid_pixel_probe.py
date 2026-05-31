@@ -30,8 +30,8 @@ from typing import TYPE_CHECKING
 
 import click
 import numpy as np
+from _plain_console import Console
 from PIL import Image
-from rich.console import Console
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray

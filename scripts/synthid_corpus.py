@@ -26,9 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import click
+from _plain_console import Console, Table
 from PIL import Image
-from rich.console import Console
-from rich.table import Table
 
 from remove_ai_watermarks.noai.c2pa import extract_c2pa_info
 

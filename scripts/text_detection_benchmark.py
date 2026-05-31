@@ -33,8 +33,8 @@ from typing import Any
 
 import cv2
 import numpy as np
+from _plain_console import Console
 from PIL import Image, ImageDraw, ImageFont
-from rich.console import Console
 
 from remove_ai_watermarks import text_protector as tp
 

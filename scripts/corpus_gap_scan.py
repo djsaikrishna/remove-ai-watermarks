@@ -30,8 +30,7 @@ from collections import Counter
 from pathlib import Path
 
 import click
-from rich.console import Console
-from rich.table import Table
+from _plain_console import Console, Table
 
 from remove_ai_watermarks.identify import identify
 from remove_ai_watermarks.metadata import _png_late_metadata
