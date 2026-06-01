@@ -190,8 +190,10 @@ class GeminiEngine:
         # Use large alpha template (96x96) as the high-quality source for downscaling
         source_alpha = self._alpha_large
 
-        # Dynamically search bottom-right corner (search up to 256x256 region)
-        search_size = int(min(min(w, h), 256))
+        # Dynamically search bottom-right corner. 512 covers up to 512px from the
+        # corner -- enough for known Gemini margin variations (standard: 64+96=160px;
+        # observed variants up to ~300px). 256 was too tight and caused misses.
+        search_size = int(min(min(w, h), 512))
         sx1 = max(0, w - search_size)
         sy1 = max(0, h - search_size)
 
