@@ -514,6 +514,45 @@ class TestBatchCommand:
         assert out[0, 0, 3] == 0
         assert out[100, 100, 3] == 255
 
+    def test_batch_auto_plans_pipeline_per_image(self, runner, tmp_path):
+        """--auto in batch re-plans the pipeline/restore/polish per image and
+        builds one engine per resolved pipeline."""
+        from remove_ai_watermarks import auto_config
+
+        input_dir = _make_batch_dir(tmp_path, count=2)
+        output_dir = tmp_path / "output"
+        plan = auto_config.AutoConfig(
+            pipeline="controlnet",
+            restore_faces=True,
+            adaptive_polish=True,
+            unsharp=0.0,
+            humanize=0.0,
+            min_resolution=1024,
+            has_face=True,
+            has_text=False,
+            edge_density=0.05,
+            width=200,
+            height=200,
+        )
+        mock_cls, mock_engine = _mock_invisible_engine()
+        with (
+            patch("remove_ai_watermarks.cli.InvisibleEngine", mock_cls, create=True),
+            patch("remove_ai_watermarks.invisible_engine.InvisibleEngine", mock_cls),
+            patch("remove_ai_watermarks.cli.invisible_available", return_value=True, create=True),
+            patch("remove_ai_watermarks.invisible_engine.is_available", return_value=True),
+            patch("remove_ai_watermarks.auto_config.plan", return_value=plan),
+        ):
+            result = runner.invoke(
+                main,
+                ["batch", str(input_dir), "-o", str(output_dir), "--mode", "invisible", "--auto"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "2 processed" in result.output
+        # Engine built with the auto-resolved controlnet pipeline.
+        assert mock_cls.call_args.kwargs["pipeline"] == "controlnet"
+        # The auto plan's adaptive polish reached the engine call.
+        assert mock_engine.remove_watermark.call_args.kwargs["adaptive_polish"] is True
+
     def test_batch_default_output_dir(self, runner, tmp_path):
         input_dir = _make_batch_dir(tmp_path)
         result = runner.invoke(

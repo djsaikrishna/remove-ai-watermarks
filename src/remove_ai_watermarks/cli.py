@@ -159,6 +159,16 @@ _unsharp_option = click.option(
     "--unsharp", type=float, default=0.0, help="Unsharp-mask sharpening strength (0 = off, typical: 0.3-0.8)."
 )
 
+_upscaler_option = click.option(
+    "--upscaler",
+    type=click.Choice(["lanczos", "esrgan"]),
+    default="lanczos",
+    help="How to upscale a small input to the --min-resolution floor: lanczos (default, cv2, no deps) or "
+    "esrgan (Real-ESRGAN via the 'esrgan' extra; better detail, slower on CPU). Best for photo/texture "
+    "content -- as a generic GAN with no face/glyph prior it can degrade faces (diffusion mitigates) and "
+    "thin text, so lanczos stays the default. Falls back to lanczos if the extra is absent. Only when upscaling.",
+)
+
 _auto_option = click.option(
     "--auto",
     is_flag=True,
@@ -208,6 +218,21 @@ def _apply_auto(
         adaptive_polish = cfg.adaptive_polish
     console.print(f"  Auto: {cfg.reason}")
     return pipeline, restore_faces, adaptive_polish
+
+
+def _warn_if_esrgan_unavailable(upscaler: str) -> None:
+    """Tell the user once if ``--upscaler esrgan`` will silently fall back to Lanczos.
+
+    The engine downgrades to Lanczos when the ``esrgan`` extra is absent (fail-safe, so
+    a batch never breaks mid-run) -- but without this notice the user would believe
+    Real-ESRGAN ran. Surfaced at the CLI layer, once per invocation (not per image).
+    """
+    if upscaler != "esrgan":
+        return
+    from remove_ai_watermarks import upscaler as _upscaler
+
+    if not _upscaler.is_available():
+        console.print("  Note: --upscaler esrgan needs the 'esrgan' extra; falling back to Lanczos.")
 
 
 def _restore_faces_options(f: Any) -> Any:
@@ -557,6 +582,7 @@ def cmd_erase(
 @_restore_faces_options
 @_min_resolution_option
 @_unsharp_option
+@_upscaler_option
 @_auto_option
 @_adaptive_polish_option
 @click.pass_context
@@ -577,6 +603,7 @@ def cmd_invisible(
     controlnet_scale: float,
     restore_faces: bool,
     restore_faces_weight: float,
+    upscaler: str,
     auto: bool,
     adaptive_polish: bool,
 ) -> None:
@@ -596,6 +623,7 @@ def cmd_invisible(
     from remove_ai_watermarks.invisible_engine import InvisibleEngine
 
     source = _validate_image(source)
+    _warn_if_esrgan_unavailable(upscaler)
     if auto:
         pipeline, restore_faces, adaptive_polish = _apply_auto(ctx, source, pipeline, restore_faces, adaptive_polish)
     if output is None:
@@ -634,6 +662,7 @@ def cmd_invisible(
         adaptive_polish=adaptive_polish,
         max_resolution=max_resolution,
         min_resolution=min_resolution,
+        upscaler=upscaler,
         vendor=vendor,
         restore_faces=restore_faces,
         restore_faces_weight=restore_faces_weight,
@@ -815,6 +844,7 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
 @_restore_faces_options
 @_min_resolution_option
 @_unsharp_option
+@_upscaler_option
 @_auto_option
 @_adaptive_polish_option
 @click.pass_context
@@ -838,6 +868,7 @@ def cmd_all(
     controlnet_scale: float,
     restore_faces: bool,
     restore_faces_weight: float,
+    upscaler: str,
     auto: bool,
     adaptive_polish: bool,
 ) -> None:
@@ -854,6 +885,7 @@ def cmd_all(
 
     _banner()
     source = _validate_image(source)
+    _warn_if_esrgan_unavailable(upscaler)
     if auto:
         pipeline, restore_faces, adaptive_polish = _apply_auto(ctx, source, pipeline, restore_faces, adaptive_polish)
 
@@ -941,6 +973,7 @@ def cmd_all(
                 adaptive_polish=adaptive_polish,
                 max_resolution=max_resolution,
                 min_resolution=min_resolution,
+                upscaler=upscaler,
                 vendor=vendor,
                 restore_faces=restore_faces,
                 restore_faces_weight=restore_faces_weight,
@@ -1001,6 +1034,9 @@ def _process_batch_image(
     restore_faces: bool = False,
     restore_faces_weight: float = 0.5,
     controlnet_scale: float = 1.0,
+    upscaler: str = "lanczos",
+    auto: bool = False,
+    adaptive_polish: bool = False,
 ) -> None:
     """Process a single image for batch mode.
 
@@ -1046,14 +1082,22 @@ def _process_batch_image(
         if invisible_available():
             from remove_ai_watermarks.invisible_engine import InvisibleEngine
 
-            if "_inv_engine" not in ctx.obj:
-                ctx.obj["_inv_engine"] = InvisibleEngine(
+            # --auto re-plans the pipeline / face-restore / polish per image; only the
+            # pipeline choice changes the engine ctor, so cache one engine per pipeline
+            # (controlnet vs default) rather than a single shared instance.
+            if auto:
+                pipeline, restore_faces, adaptive_polish = _apply_auto(
+                    ctx, img_path, pipeline, restore_faces, adaptive_polish
+                )
+            engines = ctx.obj.setdefault("_inv_engines", {})
+            if pipeline not in engines:
+                engines[pipeline] = InvisibleEngine(
                     device=None if device == "auto" else device,
                     pipeline=pipeline,
                     hf_token=hf_token,
                     controlnet_conditioning_scale=controlnet_scale,
                 )
-            engine_inv = ctx.obj["_inv_engine"]
+            engine_inv = engines[pipeline]
             engine_inv.remove_watermark(
                 img_path if mode == "invisible" else out_path,
                 out_path,
@@ -1062,8 +1106,10 @@ def _process_batch_image(
                 seed=seed,
                 humanize=humanize,
                 unsharp=unsharp,
+                adaptive_polish=adaptive_polish,
                 max_resolution=max_resolution,
                 min_resolution=min_resolution,
+                upscaler=upscaler,
                 restore_faces=restore_faces,
                 restore_faces_weight=restore_faces_weight,
                 # Detect the vendor from the pristine original (`img_path`), not the
@@ -1126,7 +1172,10 @@ def _process_batch_image(
 @_restore_faces_options
 @_min_resolution_option
 @_unsharp_option
+@_upscaler_option
 @_controlnet_scale_option
+@_auto_option
+@_adaptive_polish_option
 @click.pass_context
 def cmd_batch(
     ctx: click.Context,
@@ -1147,6 +1196,9 @@ def cmd_batch(
     restore_faces: bool,
     restore_faces_weight: float,
     controlnet_scale: float,
+    upscaler: str,
+    auto: bool,
+    adaptive_polish: bool,
 ) -> None:
     """Process all images in a directory."""
     _banner()
@@ -1164,6 +1216,8 @@ def cmd_batch(
     console.print(f"  Found {len(images)} images in {directory}")
     console.print(f"  Output -> {output_dir}")
     console.print(f"  Mode: {mode}")
+    if mode in ("invisible", "all"):
+        _warn_if_esrgan_unavailable(upscaler)
 
     processed = 0
     errors = 0
@@ -1202,6 +1256,9 @@ def cmd_batch(
                     restore_faces=restore_faces,
                     restore_faces_weight=restore_faces_weight,
                     controlnet_scale=controlnet_scale,
+                    upscaler=upscaler,
+                    auto=auto,
+                    adaptive_polish=adaptive_polish,
                 )
                 processed += 1
 

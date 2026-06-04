@@ -126,6 +126,32 @@ class InvisibleEngine:
         """Eagerly load the pipeline so download progress is visible."""
         self._remover.preload()
 
+    def _esrgan_upscale(self, image: Any, target: tuple[int, int]) -> Any:
+        """Upscale a PIL image to ``target`` with Real-ESRGAN, else Lanczos.
+
+        Runs Real-ESRGAN at its native factor (on the remover's device, CPU fallback),
+        then resizes to the exact ``target`` with Lanczos. Falls back to a plain Lanczos
+        resize when the ``esrgan`` extra is absent or the model errors.
+        """
+        import cv2
+        import numpy as np
+        from PIL import Image
+
+        from remove_ai_watermarks import upscaler
+
+        if not upscaler.is_available():
+            logger.debug("esrgan upscaler requested but the extra is absent; using Lanczos")
+            return image.resize(target, Image.Resampling.LANCZOS)
+        try:
+            bgr = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+            big = upscaler.upscale(bgr, device=self._remover.device)
+            if (big.shape[1], big.shape[0]) != target:
+                big = cv2.resize(big, target, interpolation=cv2.INTER_LANCZOS4)
+            return Image.fromarray(cv2.cvtColor(big, cv2.COLOR_BGR2RGB))
+        except Exception as e:  # never let an optional upscaler break removal
+            logger.warning("Real-ESRGAN upscale failed (%s); using Lanczos", e)
+            return image.resize(target, Image.Resampling.LANCZOS)
+
     def remove_watermark(
         self,
         image_path: Path,
@@ -142,6 +168,7 @@ class InvisibleEngine:
         restore_faces_weight: float = 0.5,
         unsharp: float = 0.0,
         adaptive_polish: bool = False,
+        upscaler: str = "lanczos",
     ) -> Path:
         """Remove invisible watermark from an image.
 
@@ -180,6 +207,11 @@ class InvisibleEngine:
                 (default) = on; 0 = off. The output is restored to the original
                 input size, so this is a transparent quality boost; it adds time
                 and memory on small inputs. Ignored on a min > max misconfig.
+            upscaler: How to upscale a small input to the ``min_resolution`` floor:
+                ``"lanczos"`` (default, cv2, no deps) or ``"esrgan"`` (Real-ESRGAN
+                via the ``esrgan`` extra). Only applies when UPscaling (the floor
+                case); a ``max_resolution`` downscale always uses Lanczos. Falls back
+                to Lanczos if the extra is absent.
 
         Returns:
             Path to the cleaned image.
@@ -202,8 +234,8 @@ class InvisibleEngine:
 
         target = _target_size(image.width, image.height, max_resolution, min_resolution)
         if target is not None:
+            upscaling = max(target) > max(image.width, image.height)
             if self._progress_callback:
-                upscaling = max(target) > max(image.width, image.height)
                 reason = (
                     f"min-resolution floor {min_resolution}px"
                     if upscaling
@@ -211,7 +243,12 @@ class InvisibleEngine:
                 )
                 verb = "Upscaling" if upscaling else "Downscaling"
                 self._progress_callback(f"{verb} {image.width}x{image.height} to {target[0]}x{target[1]} ({reason})...")
-            image = image.resize(target, Image.Resampling.LANCZOS)
+            # Real-ESRGAN only helps when UPscaling (the floor case); a downscale cap
+            # always uses Lanczos. _esrgan_upscale falls back to Lanczos if the extra is absent.
+            if upscaling and upscaler == "esrgan":
+                image = self._esrgan_upscale(image, target)
+            else:
+                image = image.resize(target, Image.Resampling.LANCZOS)
 
         # Always persist to a temp file, even without downscaling: WatermarkRemover
         # reloads by path, so the EXIF-transposed pixels must be saved or rotation

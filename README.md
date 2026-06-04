@@ -113,7 +113,7 @@ image → encode to latent space (VAE) at native resolution
       → decode back to pixels (VAE)
 ```
 
-- Large inputs run at native resolution (no down-then-up round-trip, which was the main quality loss in issue #10); use `--max-resolution N` only to cap GPU/MPS memory on very large inputs. Small inputs (long side under 1024 px) are auto-upscaled to a 1024 px floor before diffusion, because SDXL distorts on a tiny latent, and the result is restored to the original size (a transparent quality boost). Disable the floor with `--min-resolution 0`.
+- Large inputs run at native resolution (no down-then-up round-trip, which was the main quality loss in issue #10); use `--max-resolution N` only to cap GPU/MPS memory on very large inputs. Small inputs (long side under 1024 px) are auto-upscaled to a 1024 px floor before diffusion, because SDXL distorts on a tiny latent, and the result is restored to the original size (a transparent quality boost). Disable the floor with `--min-resolution 0`. The floor upscale uses Lanczos by default; `--upscaler esrgan` (the `esrgan` extra) runs Real-ESRGAN first for sharper detail and falls back to Lanczos if the extra is absent. ESRGAN is a generic photo/texture GAN with no face/glyph prior, so it is best for photo/texture content -- it can degrade faces (the diffusion pass regenerates them, so the final recovers) and thin text; keep Lanczos for text-heavy inputs.
 
 > **Default strength is vendor-adaptive (no flag needed).** The tool reads the C2PA issuer to detect which vendor's SynthID is present and picks the strength that clears it with the least quality loss: **OpenAI gpt-image → `0.10`**, **Google Gemini → `0.15`**, **unknown source → `0.15`**. An oracle-verified June 2026 study (clean pipeline, per-image openai.com/verify or Gemini app) found OpenAI's watermark clears at `0.05` across `1024`-`1600` px (resolution-independent) while Google's is ~3x more robust and needs `0.15`. The dominant factor is the vendor, not resolution. There is no local SynthID detector, so if the oracle still reads SynthID, raise `--strength`; if you care more about preserving fine text, lower it. (Caveat: Google's `0.15` was validated on the capped `--max-resolution 1536` path; a very large native Gemini image may need more.)
 >
@@ -213,6 +213,14 @@ After installation the `remove-ai-watermarks` command is available system-wide.
 > ```bash
 > pip install -e ".[restore]"   # or: uv pip install -e ".[restore]"
 > ```
+>
+> For sharper upscaling of small inputs before diffusion (`--upscaler esrgan`,
+> Real-ESRGAN), install the `esrgan` extra. It loads via spandrel (MIT, no basicsr);
+> the Real-ESRGAN weights (BSD-3-Clause) download on first use:
+>
+> ```bash
+> pip install -e ".[esrgan]"   # or: uv pip install -e ".[esrgan]"
+> ```
 
 #### Invisible watermark removal
 
@@ -280,7 +288,8 @@ remove-ai-watermarks erase image.png --region 1640,1930,400,100 -o clean.png
 remove-ai-watermarks invisible image.png -o clean.png --humanize 4.0 --unsharp 0.5
 # --humanize adds film grain, --unsharp counters the soft "AI" look (both opt-in).
 # Large images run at native resolution; small ones are upscaled to a 1024 floor
-# first (disable with --min-resolution 0). On a very large image that OOMs the
+# first (disable with --min-resolution 0); --upscaler esrgan uses Real-ESRGAN for
+# that floor upscale (needs the 'esrgan' extra). On a very large image that OOMs the
 # GPU/MPS, cap the long side: --max-resolution 2048
 # Strength is vendor-adaptive by default (OpenAI 0.10 / Google 0.15); override
 # with --strength. To preserve text/face structure, use --pipeline controlnet
@@ -301,6 +310,10 @@ remove-ai-watermarks metadata image.png --remove
 
 # Batch with a specific mode
 remove-ai-watermarks batch ./images/ --mode visible
+
+# Batch also accepts --auto (and --adaptive-polish): the plan is recomputed per
+# image, so a mixed directory routes each file to the right pipeline
+remove-ai-watermarks batch ./images/ --mode all --auto
 ```
 
 ### Python API

@@ -17,14 +17,15 @@ text/graphics (already high-frequency, so almost no polish) and spares text/edge
 masking the grain.
 
 Detection is **cv2-only and torch-free**: OpenCV YuNet (``cv2.FaceDetectorYN``) for
-faces -- a 232 KB MIT-licensed model bundled in ``assets/`` -- plus a Canny
-edge-density + MSER region heuristic for text/structure. The whole planner peaks
-~100 MB RSS in a few ms, so it adds nothing meaningful to a GPU run and runs anywhere
-the pipeline runs.
+faces -- a 232 KB MIT-licensed model bundled in ``assets/`` -- DBNet (PP-OCRv3
+differentiable-binarization via ``cv2.dnn.TextDetectionModel_DB``, a 2.4 MB Apache-2.0
+model bundled in ``assets/``) for text, and a Canny ``edge_density``. The whole planner
+peaks ~100 MB RSS in a few ms, so it adds nothing meaningful to a GPU run and runs
+anywhere the pipeline runs.
 
-The text heuristic is a deliberately rough Phase-1 placeholder (DBNet via cv2.dnn is
-the planned precision upgrade); it only ever ADDS controlnet, so a miss is backstopped
-by the edge-density route and a false positive only costs a controlnet run.
+The text detector falls back to the old MSER region heuristic if the DBNet model can't
+load. Either way text only ever ADDS controlnet, so a miss is backstopped by the
+edge-density route and a false positive only costs a controlnet run.
 """
 
 # cv2/numpy boundary: cv2 ships no usable element types; relax the unknown-type rules
@@ -47,14 +48,28 @@ logger = logging.getLogger(__name__)
 # preserve). The headshot measures ~0.022, a busy photo higher; only a near-flat
 # gradient/solid image falls under 0.008.
 _STRUCTURELESS_EDGE_MAX = 0.008
-# MSER regions per megapixel above this -> likely text. Rough Phase-1 heuristic: a
-# no-text portrait measures a few hundred/MP, dense text far more. Set high so it
-# rarely false-fires; it only ever ADDS controlnet so miscalibration is low-harm.
+# MSER regions per megapixel above this -> likely text. The MSER path is now only the
+# FALLBACK when the bundled DBNet model can't load; DBNet (below) is the primary text
+# detector. Rough heuristic: a no-text portrait measures a few hundred/MP, dense text
+# far more. Set high so it rarely false-fires; text only ever ADDS controlnet.
 _TEXT_MSER_PER_MP = 1500.0
 _FACE_SCORE = 0.6  # YuNet confidence for a face to count
 # Downscale the long side to this for DETECTION only (faces stay detectable down to
-# ~10px, and this bounds YuNet/MSER cost on huge inputs). Removal runs at full res.
+# ~10px, and this bounds YuNet/DBNet/MSER cost on huge inputs). Removal runs at full res.
 _DETECT_MAX_SIDE = 1024
+
+# DBNet (PP-OCRv3 differentiable-binarization) text-region detector via cv2.dnn -- the
+# primary "has meaningful text" signal. The model is the shared PP-OCRv3 detection net
+# from OpenCV Zoo (Apache-2.0); en/cn variants are byte-identical, so it is bundled
+# language-neutral. cv2.dnn is core OpenCV, so this adds NO new pip dependency.
+_DBNET_ASSET = "text_detection_ppocrv3_2023may.onnx"  # Apache-2.0 (OpenCV Zoo PP-OCRv3 DB)
+_DBNET_BINARY_THRESHOLD = 0.3
+_DBNET_POLYGON_THRESHOLD = 0.5
+_DBNET_MAX_CANDIDATES = 200
+_DBNET_UNCLIP_RATIO = 2.0
+_DBNET_INPUT_SIDE = 736  # square input, multiple of 32 (PP-OCRv3 default)
+_DBNET_MEAN = (122.67891434, 116.66876762, 104.00698793)  # ImageNet mean * 255
+_dbnet: Any = None  # lazy singleton; set to False after a load failure (-> MSER fallback)
 
 # When a smoothing pass ran (controlnet or face restore), the adaptive polish
 # (humanizer.adaptive_polish) restores the input's detail level, sparing text --
@@ -152,8 +167,41 @@ def detect_face(image: NDArray[Any]) -> bool:
     return faces is not None and len(faces) > 0
 
 
-def detect_text(image: NDArray[Any]) -> bool:
-    """Rough MSER-based text-presence heuristic (Phase-1 placeholder for DBNet)."""
+def _detect_text_dbnet(image: NDArray[Any]) -> bool | None:
+    """DBNet (PP-OCRv3) text-region presence via cv2.dnn.
+
+    Returns True/False on a successful run, or None if the bundled model can't load
+    (the caller then falls back to the MSER heuristic). Loads once, lazily.
+    """
+    import cv2
+
+    global _dbnet
+    if _dbnet is False:  # a prior load failed; skip straight to the MSER fallback
+        return None
+    img = _to_bgr(image)
+    h, w = img.shape[:2]
+    if h < 1 or w < 1:
+        return False
+    try:
+        if _dbnet is None:
+            model = Path(__file__).parent / "assets" / _DBNET_ASSET
+            net = cv2.dnn.TextDetectionModel_DB(str(model))
+            net.setBinaryThreshold(_DBNET_BINARY_THRESHOLD)
+            net.setPolygonThreshold(_DBNET_POLYGON_THRESHOLD)
+            net.setMaxCandidates(_DBNET_MAX_CANDIDATES)
+            net.setUnclipRatio(_DBNET_UNCLIP_RATIO)
+            net.setInputParams(1.0 / 255.0, (_DBNET_INPUT_SIDE, _DBNET_INPUT_SIDE), _DBNET_MEAN)
+            _dbnet = net
+        boxes, _ = _dbnet.detect(img)
+    except Exception as e:  # model load / inference can raise cv2.error or others
+        logger.debug("DBNet text detect failed (%s); falling back to MSER", e)
+        _dbnet = False
+        return None
+    return boxes is not None and len(boxes) > 0
+
+
+def _detect_text_mser(image: NDArray[Any]) -> bool:
+    """Fallback MSER-based text-presence heuristic (used only if DBNet can't load)."""
     import cv2
 
     gray = _to_gray(image)
@@ -164,6 +212,12 @@ def detect_text(image: NDArray[Any]) -> bool:
         return False
     per_mp = len(regions) / max(1e-6, (h * w) / 1e6)
     return per_mp > _TEXT_MSER_PER_MP
+
+
+def detect_text(image: NDArray[Any]) -> bool:
+    """Text-presence: DBNet (cv2.dnn) when the bundled model loads, else the MSER heuristic."""
+    dbnet = _detect_text_dbnet(image)
+    return _detect_text_mser(image) if dbnet is None else dbnet
 
 
 def edge_density(image: NDArray[Any]) -> float:
@@ -190,9 +244,9 @@ def plan(image_path: Path) -> AutoConfig | None:
 
     h, w = image.shape[:2]
     small = _downscale_for_detection(image)
-    gray = _to_gray(small)  # convert once; the text/edge detectors pass a gray input through
+    gray = _to_gray(small)  # convert once; edge density + the MSER fallback use gray
     has_face = detect_face(small)  # YuNet needs the 3-channel image
-    has_text = detect_text(gray)
+    has_text = detect_text(small)  # DBNet wants BGR; the MSER fallback grays it internally
     edges = edge_density(gray)
 
     structureless = (not has_face) and (not has_text) and edges < _STRUCTURELESS_EDGE_MAX

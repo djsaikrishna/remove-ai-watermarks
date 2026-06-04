@@ -34,6 +34,26 @@ class TestDetectors:
         cv2.putText(text, "HELLO AI TEXT", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 3)
         assert auto_config.edge_density(text) > auto_config.edge_density(blank)
 
+    def test_dbnet_detects_text_card(self):
+        """The bundled PP-OCRv3 DBNet model fires on a clear text card and not on flat."""
+        card = np.full((300, 500, 3), 255, dtype=np.uint8)
+        cv2.putText(card, "INVOICE TOTAL 1234", (10, 170), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 4)
+        assert auto_config._detect_text_dbnet(card) is True
+        assert auto_config._detect_text_dbnet(np.full((300, 500, 3), 128, dtype=np.uint8)) is False
+
+    def test_detect_text_falls_back_to_mser_when_dbnet_unavailable(self, monkeypatch):
+        """If DBNet can't load (returns None), detect_text uses the MSER heuristic."""
+        monkeypatch.setattr(auto_config, "_detect_text_dbnet", lambda _img: None)
+        called = {}
+
+        def _fake_mser(_img):
+            called["mser"] = True
+            return True
+
+        monkeypatch.setattr(auto_config, "_detect_text_mser", _fake_mser)
+        assert auto_config.detect_text(np.full((100, 100, 3), 128, dtype=np.uint8)) is True
+        assert called.get("mser") is True
+
 
 class TestPlan:
     def test_unreadable_returns_none(self, tmp_path):

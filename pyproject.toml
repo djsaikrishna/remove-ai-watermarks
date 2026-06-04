@@ -92,6 +92,19 @@ restore = [
     "scipy<1.18",
     "numba<0.60",
 ]
+# Optional pre-diffusion super-resolution for small inputs (Real-ESRGAN). Loaded via
+# spandrel (MIT) -- a pure model-loader with NO basicsr dependency (it pulls only
+# torch / torchvision / safetensors / numpy / einops), which sidesteps the
+# basicsr / torchvision.functional_tensor breakage that the `restore` extra fights.
+# The Real-ESRGAN weights (BSD-3-Clause) download on first use and are cached; they
+# are never bundled. CPU works but is slow on large inputs -- it is meant for the
+# pre-diffusion upscale of SMALL inputs (and the GPU worker). Guarded by
+# upscaler.is_available(); the default upscaler stays Lanczos (cv2, no deps). The
+# weights are fetched with torch.hub (bundled with spandrel's torch), so no extra
+# download dependency is needed.
+esrgan = [
+    "spandrel>=0.3.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.1.0",
