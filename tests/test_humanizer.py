@@ -102,3 +102,48 @@ def test_unsharp_flat_image_is_a_noop():
     img = np.full((30, 30, 3), 128, dtype=np.uint8)
     result = unsharp_mask(img, amount=0.8, sigma=1.0)
     assert np.array_equal(result, img)
+
+
+class TestAdaptivePolish:
+    """Adaptive polish: target the reference's detail level, sparing text/edges."""
+
+    def test_noop_when_already_sharp(self):
+        from remove_ai_watermarks.humanizer import adaptive_polish
+
+        rng = np.random.default_rng(1)
+        sharp = rng.integers(0, 256, (120, 120, 3), dtype=np.uint8)  # high detail
+        soft_ref = np.full((120, 120, 3), 128, dtype=np.uint8)  # flat -> low target
+        out = adaptive_polish(sharp, soft_ref)
+        assert np.array_equal(out, sharp)  # current >= target -> unchanged copy
+
+    def test_sharpens_a_soft_image_toward_reference(self):
+        import cv2
+
+        from remove_ai_watermarks.humanizer import _laplacian_variance, adaptive_polish
+
+        rng = np.random.default_rng(2)
+        reference = rng.integers(0, 256, (160, 160, 3), dtype=np.uint8)  # very high detail
+        soft = cv2.GaussianBlur(reference, (0, 0), sigmaX=4.0)  # blurred -> low detail
+        out = adaptive_polish(soft, reference, seed=0)
+        assert _laplacian_variance(out) > _laplacian_variance(soft)  # moved toward the target
+
+    def test_mask_spares_edges(self):
+        from remove_ai_watermarks.humanizer import _smooth_grain_mask
+
+        img = np.full((100, 100, 3), 128, dtype=np.uint8)
+        img[:, 50:] = 30  # a hard vertical edge down the middle
+        mask = _smooth_grain_mask(img)
+        # Flat far-left region keeps grain; the column at the edge is suppressed.
+        assert mask[:, :15].mean() > mask[:, 45:55].mean()
+
+    def test_deterministic_with_seed(self):
+        import cv2
+
+        from remove_ai_watermarks.humanizer import adaptive_polish
+
+        rng = np.random.default_rng(3)
+        reference = rng.integers(0, 256, (140, 140, 3), dtype=np.uint8)
+        soft = cv2.GaussianBlur(reference, (0, 0), sigmaX=3.0)
+        a = adaptive_polish(soft, reference, seed=7)
+        b = adaptive_polish(soft, reference, seed=7)
+        assert np.array_equal(a, b)

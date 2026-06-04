@@ -141,6 +141,7 @@ class InvisibleEngine:
         restore_faces: bool = False,
         restore_faces_weight: float = 0.5,
         unsharp: float = 0.0,
+        adaptive_polish: bool = False,
     ) -> Path:
         """Remove invisible watermark from an image.
 
@@ -163,6 +164,12 @@ class InvisibleEngine:
                 Applied last (after face restoration) to counter the soft,
                 over-smoothed look of the diffusion/GFPGAN passes; ~0.5-0.8 is a
                 safe range, higher risks edge halos.
+            adaptive_polish: When True (the --auto mode default), restore the input's
+                detail level in the softened output instead of fixed unsharp/humanize:
+                a capped unsharp + edge-masked grain targeting the input's Laplacian
+                variance (self-limiting on text/graphics). Runs LAST, after face
+                restoration. The fixed ``humanize``/``unsharp`` knobs are normally 0
+                when this is on.
             max_resolution: Cap the long side (px) before diffusion. 0 (default)
                 = no cap. Set a positive value only to bound GPU/MPS memory on
                 very large inputs (it reintroduces a lossy downscale->upscale
@@ -189,6 +196,9 @@ class InvisibleEngine:
         image = Image.open(image_path)
         image = ImageOps.exif_transpose(image)
         orig_size = image.size  # (width, height)
+        # Full-res original, kept for the adaptive-polish detail target (image is
+        # reassigned to the resized copy below; PIL resize returns a new object).
+        reference_pil = image
 
         target = _target_size(image.width, image.height, max_resolution, min_resolution)
         if target is not None:
@@ -286,6 +296,23 @@ class InvisibleEngine:
                     if self._progress_callback:
                         self._progress_callback(f"Sharpening (unsharp mask: {unsharp})...")
                     image_io.imwrite(out_path, unsharp_mask(out_cv, amount=unsharp))
+
+            # Adaptive polish (--auto): restore the input's detail level in the softened
+            # output, sparing text/edges. Replaces the fixed unsharp/humanize knobs.
+            if adaptive_polish:
+                import cv2
+                import numpy as np
+
+                from remove_ai_watermarks import humanizer, image_io
+
+                out_cv = image_io.imread(out_path, cv2.IMREAD_COLOR)
+                if out_cv is not None:
+                    ref = cv2.cvtColor(np.array(reference_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+                    if (ref.shape[1], ref.shape[0]) != (out_cv.shape[1], out_cv.shape[0]):
+                        ref = cv2.resize(ref, (out_cv.shape[1], out_cv.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+                    if self._progress_callback:
+                        self._progress_callback("Adaptive polish (sharpen + grain to the input's detail level)...")
+                    image_io.imwrite(out_path, humanizer.adaptive_polish(out_cv, ref, seed=seed))
 
             return out_path
         finally:

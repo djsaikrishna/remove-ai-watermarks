@@ -163,8 +163,18 @@ _auto_option = click.option(
     "--auto",
     is_flag=True,
     default=False,
-    help="Auto-pick quality modes (pipeline, face restore, sharpen/grain) from image content. "
-    "Explicit flags override. EXPERIMENTAL.",
+    help="Auto-pick the pipeline, face restore, and adaptive polish from image content. "
+    "Every choice is overridable -- an explicit --pipeline / --restore-faces / --adaptive-polish "
+    "always wins. EXPERIMENTAL.",
+)
+
+_adaptive_polish_option = click.option(
+    "--adaptive-polish/--no-adaptive-polish",
+    default=False,
+    help="Restore the input's detail level after removal (capped unsharp + edge-masked grain "
+    "targeting the input's sharpness, sparing text). On by default under --auto; pass "
+    "--no-adaptive-polish to disable it there, or --adaptive-polish to use it without --auto. "
+    "Independent of the fixed --unsharp/--humanize. EXPERIMENTAL.",
 )
 
 
@@ -173,19 +183,19 @@ def _apply_auto(
     source: Path,
     pipeline: str,
     restore_faces: bool,
-    unsharp: float,
-    humanize: float,
-) -> tuple[str, bool, float, float]:
-    """Resolve ``--auto``: plan modes from the image, overriding only the flags the
-    user left at their default (an explicit flag always wins). Returns the resolved
-    ``(pipeline, restore_faces, unsharp, humanize)`` and prints the chosen plan.
+    adaptive_polish: bool,
+) -> tuple[str, bool, bool]:
+    """Resolve ``--auto``: plan the three content-adaptive modes (pipeline, face
+    restore, adaptive polish) from the image, overriding only the ones the user left
+    at their default (an explicit flag always wins). The fixed ``--unsharp``/
+    ``--humanize`` filters are independent and untouched. Prints the chosen plan.
     """
     from remove_ai_watermarks import auto_config
 
     cfg = auto_config.plan(source)
     if cfg is None:
         console.print("  Auto: could not read image; using defaults")
-        return pipeline, restore_faces, unsharp, humanize
+        return pipeline, restore_faces, adaptive_polish
 
     def _is_default(name: str) -> bool:
         return ctx.get_parameter_source(name) == click.core.ParameterSource.DEFAULT
@@ -194,12 +204,10 @@ def _apply_auto(
         pipeline = cfg.pipeline
     if _is_default("restore_faces"):
         restore_faces = cfg.restore_faces
-    if _is_default("unsharp"):
-        unsharp = cfg.unsharp
-    if _is_default("humanize"):
-        humanize = cfg.humanize
+    if _is_default("adaptive_polish"):
+        adaptive_polish = cfg.adaptive_polish
     console.print(f"  Auto: {cfg.reason}")
-    return pipeline, restore_faces, unsharp, humanize
+    return pipeline, restore_faces, adaptive_polish
 
 
 def _restore_faces_options(f: Any) -> Any:
@@ -550,6 +558,7 @@ def cmd_erase(
 @_min_resolution_option
 @_unsharp_option
 @_auto_option
+@_adaptive_polish_option
 @click.pass_context
 def cmd_invisible(
     ctx: click.Context,
@@ -569,6 +578,7 @@ def cmd_invisible(
     restore_faces: bool,
     restore_faces_weight: float,
     auto: bool,
+    adaptive_polish: bool,
 ) -> None:
     """Remove invisible AI watermarks (SynthID, StableSignature, TreeRing).
 
@@ -587,9 +597,7 @@ def cmd_invisible(
 
     source = _validate_image(source)
     if auto:
-        pipeline, restore_faces, unsharp, humanize = _apply_auto(
-            ctx, source, pipeline, restore_faces, unsharp, humanize
-        )
+        pipeline, restore_faces, adaptive_polish = _apply_auto(ctx, source, pipeline, restore_faces, adaptive_polish)
     if output is None:
         output = source.with_stem(source.stem + "_clean")
 
@@ -623,6 +631,7 @@ def cmd_invisible(
         seed=seed,
         humanize=humanize,
         unsharp=unsharp,
+        adaptive_polish=adaptive_polish,
         max_resolution=max_resolution,
         min_resolution=min_resolution,
         vendor=vendor,
@@ -807,6 +816,7 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
 @_min_resolution_option
 @_unsharp_option
 @_auto_option
+@_adaptive_polish_option
 @click.pass_context
 def cmd_all(
     ctx: click.Context,
@@ -829,6 +839,7 @@ def cmd_all(
     restore_faces: bool,
     restore_faces_weight: float,
     auto: bool,
+    adaptive_polish: bool,
 ) -> None:
     """Remove ALL watermarks: visible + invisible + metadata.
 
@@ -844,9 +855,7 @@ def cmd_all(
     _banner()
     source = _validate_image(source)
     if auto:
-        pipeline, restore_faces, unsharp, humanize = _apply_auto(
-            ctx, source, pipeline, restore_faces, unsharp, humanize
-        )
+        pipeline, restore_faces, adaptive_polish = _apply_auto(ctx, source, pipeline, restore_faces, adaptive_polish)
 
     if output is None:
         output = source.with_stem(source.stem + "_clean")
@@ -929,6 +938,7 @@ def cmd_all(
                 seed=seed,
                 humanize=humanize,
                 unsharp=unsharp,
+                adaptive_polish=adaptive_polish,
                 max_resolution=max_resolution,
                 min_resolution=min_resolution,
                 vendor=vendor,

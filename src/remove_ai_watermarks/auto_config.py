@@ -9,16 +9,18 @@ host (image work there OOM-crashes the container).
 Routing is **quality-priority**: ControlNet (text/face-structure preservation) is the
 default; it is only skipped for a clearly structure-less image (no face, no text,
 near-zero edges), where plain SDXL is cheaper and just as good. GFPGAN face
-restoration is enabled when a face is present. A mild sharpen + grain polish is added
-when a smoothing pass (controlnet or face restore) ran, to counter the over-smoothed
-"AI look".
+restoration is enabled when a face is present. When a smoothing pass (controlnet or
+face restore) ran, the **adaptive polish** (``humanizer.adaptive_polish``) restores
+the input's detail level -- a capped unsharp + edge-masked grain targeting the input's
+Laplacian variance -- to counter the over-smoothed "AI look". It is self-limiting on
+text/graphics (already high-frequency, so almost no polish) and spares text/edges by
+masking the grain.
 
 Detection is **cv2-only and torch-free**: OpenCV YuNet (``cv2.FaceDetectorYN``) for
 faces -- a 232 KB MIT-licensed model bundled in ``assets/`` -- plus a Canny
 edge-density + MSER region heuristic for text/structure. The whole planner peaks
 ~100 MB RSS in a few ms, so it adds nothing meaningful to a GPU run and runs anywhere
-the pipeline runs. (Phase 1 applies a fixed mild polish; an adaptive Laplacian-variance
-polish that measures the OUTPUT is a later phase.)
+the pipeline runs.
 
 The text heuristic is a deliberately rough Phase-1 placeholder (DBNet via cv2.dnn is
 the planned precision upgrade); it only ever ADDS controlnet, so a miss is backstopped
@@ -54,10 +56,9 @@ _FACE_SCORE = 0.6  # YuNet confidence for a face to count
 # ~10px, and this bounds YuNet/MSER cost on huge inputs). Removal runs at full res.
 _DETECT_MAX_SIDE = 1024
 
-# Auto polish applied only when a smoothing pass ran (controlnet or face restore),
-# to counter the soft "AI look". Conservative defaults; the user can override.
-_AUTO_UNSHARP = 0.5
-_AUTO_HUMANIZE = 2.0
+# When a smoothing pass ran (controlnet or face restore), the adaptive polish
+# (humanizer.adaptive_polish) restores the input's detail level, sparing text --
+# replacing the old fixed unsharp/grain which over-/under-corrected and speckled text.
 _UPSCALE_FLOOR = 1024
 
 _YUNET_ASSET = "face_detection_yunet_2023mar.onnx"  # MIT (Shiqi Yu), OpenCV Zoo
@@ -70,7 +71,8 @@ class AutoConfig:
 
     pipeline: str  # "default" | "controlnet"
     restore_faces: bool
-    unsharp: float
+    adaptive_polish: bool  # restore the input's detail level (sharpen + masked grain), sparing text
+    unsharp: float  # fixed-polish knobs, 0 in auto (the adaptive polish replaces them)
     humanize: float
     min_resolution: int
     # signals retained for logging / debugging a bad pick
@@ -88,7 +90,12 @@ class AutoConfig:
             bits.append("text")
         bits.append(f"edges={self.edge_density:.3f}")
         rf = ", face-restore on" if self.restore_faces else ""
-        polish = f", unsharp {self.unsharp}/grain {self.humanize}" if (self.unsharp or self.humanize) else ""
+        if self.adaptive_polish:
+            polish = ", adaptive polish"
+        elif self.unsharp or self.humanize:
+            polish = f", unsharp {self.unsharp}/grain {self.humanize}"
+        else:
+            polish = ""
         return f"{'+'.join(bits)} -> {self.pipeline} pipeline{rf}{polish}"
 
 
@@ -196,8 +203,9 @@ def plan(image_path: Path) -> AutoConfig | None:
     cfg = AutoConfig(
         pipeline=pipeline,
         restore_faces=restore_faces,
-        unsharp=_AUTO_UNSHARP if smoothing else 0.0,
-        humanize=_AUTO_HUMANIZE if smoothing else 0.0,
+        adaptive_polish=smoothing,  # adaptive (detail-targeted) polish when a smoothing pass ran
+        unsharp=0.0,
+        humanize=0.0,
         min_resolution=_UPSCALE_FLOOR,
         has_face=has_face,
         has_text=has_text,

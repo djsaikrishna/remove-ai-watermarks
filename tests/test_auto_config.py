@@ -45,7 +45,8 @@ class TestPlan:
         assert cfg is not None
         assert cfg.pipeline == "default"  # structure-less -> plain SDXL
         assert cfg.restore_faces is False
-        assert cfg.unsharp == 0.0  # no smoothing pass -> no polish
+        assert cfg.adaptive_polish is False  # no smoothing pass -> no polish
+        assert cfg.unsharp == 0.0
         assert cfg.humanize == 0.0
         assert cfg.min_resolution == 1024
 
@@ -65,8 +66,9 @@ class TestPlan:
         assert cfg.has_face
         assert cfg.restore_faces
         assert cfg.pipeline == "controlnet"
-        assert cfg.unsharp == 0.5  # smoothing pass ran -> polish on
-        assert cfg.humanize == 2.0
+        assert cfg.adaptive_polish  # smoothing pass ran -> adaptive polish on
+        assert cfg.unsharp == 0.0  # fixed knobs off; the adaptive polish replaces them
+        assert cfg.humanize == 0.0
 
     def test_text_signal_forces_controlnet_on_flat(self, tmp_path, monkeypatch):
         monkeypatch.setattr(auto_config, "detect_text", lambda _img: True)
@@ -82,8 +84,9 @@ class TestReason:
         cfg = auto_config.AutoConfig(
             pipeline="controlnet",
             restore_faces=True,
-            unsharp=0.5,
-            humanize=2.0,
+            adaptive_polish=True,
+            unsharp=0.0,
+            humanize=0.0,
             min_resolution=1024,
             has_face=True,
             has_text=False,
@@ -95,4 +98,4 @@ class TestReason:
         assert "controlnet" in r
         assert "face" in r
         assert "face-restore on" in r
-        assert "unsharp 0.5" in r
+        assert "adaptive polish" in r
