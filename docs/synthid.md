@@ -387,17 +387,44 @@ the plain `default` SDXL img2img pass is the shippable path.
 
 - **Text + structure:** `--pipeline controlnet` (SDXL img2img + a canny ControlNet,
   experimental/opt-in) conditions the regeneration on the edge map, so text and
-  structure stay sharp
-  while every pixel is still regenerated -- SynthID is removed everywhere. Verified
-  better than plain img2img at the same strength (text stays legible where plain
-  garbles it), and the controlnet background scrub reads clean on the oracle.
+  structure stay sharp while every pixel is still regenerated. Text legibility is
+  better than plain img2img at the same strength (text stays readable where plain
+  garbles it). **BUT removal efficacy at the low vendor-adaptive strength is CONTENT ×
+  PIPELINE dependent and NEITHER pipeline clears all content -- oracle-validated
+  2026-06-04 (8 OpenAI images, strength 0.10/0.15, max-res 1536).** The survivors FLIP
+  by content type: **photoreal** (a 9-face grid, a bracelet product photo) SURVIVES
+  controlnet but CLEARS `default`; **flat graphic** (a logo/poster with large flat
+  color fills) SURVIVES `default` but CLEARS controlnet; a flat **text** card cleared
+  under both. Why: controlnet's dense edge map keeps the regen too close to the
+  original on photoreal (so SynthID survives) but freely repaints flat fills (so it
+  clears them); plain img2img at low strength perturbs photoreal texture enough but
+  barely touches flat fills. **Root cause = insufficient STRENGTH, not the pipeline:
+  the vendor-adaptive 0.10 is NOT universally sufficient (the June numbers below held
+  for the content they were measured on). The robust fix is a HIGHER strength,
+  oracle-revalidated per content type (controlnet can be cranked harder without losing
+  structure; a lower `controlnet_conditioning_scale` also frees the regen on
+  photoreal).** So neither `--pipeline controlnet` nor plain `default` is a drop-in
+  removal guarantee at today's strength -- pick by what you must PRESERVE (controlnet
+  for text/structure), then raise strength until the oracle reads clean. (The earlier
+  "reads clean on the oracle" claim held only for the one flat/text-background case it
+  was checked on; it does not generalize.)
 - **Face identity:** canny holds face *structure* but not *identity*. Shipped as the
   optional `--restore-faces` GFPGAN post-pass (`face_restore.py`, the `restore`
   extra, experimental/opt-in, off by default). It runs GFPGAN on the ORIGINAL
-  faces and feather-composites the restored face REGIONS into the cleaned image:
-  GFPGAN RE-SYNTHESIZES each face from a StyleGAN2 prior (GAN pixels, not original
-  -> scrubs SynthID) at a low fidelity weight (`--restore-faces-weight`, default
-  `0.5`). Oracle-confirmed clean in face regions with identity preserved. Commercial-
+  faces and feather-composites the restored face REGIONS into the cleaned image.
+  **WARNING (oracle-confirmed 2026-06-04): this pass can RE-INTRODUCE SynthID into
+  the face regions -- the earlier "GFPGAN re-synthesizes from a StyleGAN2 prior ->
+  scrubs SynthID -> oracle-confirmed clean" claim was WRONG.** At the default fidelity
+  weight `0.5` GFPGAN blends ~half the ORIGINAL (watermarked) face pixels with the
+  prior, and SynthID is robust to that partial blend, so the composited face carries
+  the watermark back in -- over the diffusion-cleaned face. Confirmed by a clean A/B:
+  `gemini_3` read SynthID-detected after controlnet @ 0.20/0.25 WITH restore, but
+  NOT-detected after the same controlnet @ 0.20 with `--no-restore-faces` (only
+  restore differed). Content-dependent (a second face image cleared WITH restore),
+  which is why a single-image check earlier read "clean". **Fix directions (not yet
+  done): run GFPGAN on the diffusion-CLEANED image not the original; or drop the
+  weight well below 0.5; or leave restore OFF for removal -- each needs oracle
+  re-validation.** Commercial-
   safe (GFPGAN Apache-2.0 + RetinaFace MIT); the CodeFormer alternative is
   NON-COMMERCIAL and is not shipped. (An IP-Adapter FaceID approach was tried and
   REMOVED -- it needs high denoise strength and corrupts faces at removal strength;
@@ -408,7 +435,14 @@ the plain `default` SDXL img2img pass is the shippable path.
 There is no single permanent correct strength, but the controlled June 2026
 study (section 2.2) gives empirical floors:
 
-- **OpenAI**: 0.05 clears across 1024-1600 (n=4). 0.30 is large overkill here.
+- **OpenAI**: 0.05 clears across 1024-1600 (n=4) -- **but content-dependent, NOT
+  universal.** The follow-up oracle pass (2026-06-04, 8 images) found a flat-graphic
+  OpenAI logo/poster still SynthID-detected after `default` at 0.10, and photoreal
+  images still detected after controlnet at 0.10/0.15: at low strength the
+  low-change regions (large flat fills under `default`, dense edges under controlnet)
+  are not perturbed enough. So the 0.05 floor held only for the n=4 content it was
+  measured on; treat it as a lower bound, not a guarantee, and raise + oracle-recheck
+  per content type (see §5.1 controlnet bullet).
 - **Google (capped 1536)**: 0.15 (n=4); 0.05 and 0.10 do not clear.
 - **Google native 2816**: not locally measured; likely needs >= 0.30 (vendor +
   resolution stack). Use a GPU or `--max-resolution 1536`.
@@ -446,6 +480,87 @@ regeneration artifacts. The Goonatilake & Ateniese paper shows the strongest
 diffusion-based removers are simultaneously the most forensically detectable
 (AUROC up to 0.9999). The tradeoff is unavoidable with current diffusion-based
 approaches: defeating the vendor's verifier is not the same as being clean.
+
+### 5.5 Oracle validation log -- 2026-06-04 OpenAI pass
+
+Eight OpenAI `gpt-image` originals run through both pipelines and checked on
+openai.com/verify (the OpenAI SynthID oracle). `--max-resolution 1536`; strength
+is the vendor-adaptive default (`vendor_for_strength`): images with an OpenAI C2PA
+manifest get `OPENAI_STRENGTH` 0.10, the one without C2PA falls to
+`UNKNOWN_STRENGTH` 0.15. "detected" = SynthID still found (removal FAILED);
+"clean" = SynthID not detected.
+
+| image | content type | size | strength | `--auto`/controlnet | `default` |
+|---|---|---|---|---|---|
+| typography card | flat text | 1122x1402 | 0.10 | clean | clean |
+| raiw.cc poster | flat graphic (logo + flat fills) | 1024x1536 | 0.10 | clean | **detected** |
+| 9-face grid | photoreal | 1448x1086 | 0.10 | **detected** | clean |
+| bracelet product photo | photoreal | 1600x1600 | 0.15 | **detected** | clean |
+
+(The other four cleared under both and are omitted.) **Reading:** at this strength
+NEITHER pipeline removes SynthID on all content -- the survivors flip by content
+type. Photoreal survives controlnet / clears `default`; flat graphic survives
+`default` / clears controlnet; flat text clears both.
+
+**Follow-up: removal near the threshold is NON-DETERMINISTIC (seed-dependent).**
+Re-running the two photoreal survivors through controlnet at an explicit
+`--strength 0.15` (`--auto`, same `--max-resolution 1536`) cleared BOTH on the
+oracle (SynthID not detected). But the bracelet had SURVIVED controlnet at the
+SAME 0.15 in the first pass (it was the no-C2PA image, so its vendor-adaptive
+strength was already 0.15) -- same pipeline + strength + resolution, only the
+random (unset) seed differed between runs. So **0.15 is the borderline floor for
+controlnet photoreal, not a robust guarantee**: at the threshold the same
+image+settings can pass or fail run-to-run. img2img runs with `seed=None` (random)
+unless `--seed` is passed, so a removal SERVICE gets a coin-flip near threshold and
+has no local SynthID detector to self-verify.
+
+**Controlnet strength ladder on the two photoreal images (oracle, `--auto`,
+`--max-resolution 1536`):**
+
+| controlnet strength | 9-face grid | bracelet photo |
+|---|---|---|
+| 0.10 | detected | (was 0.15) |
+| 0.15 | clean | **non-deterministic** (survived pass 1, clean pass 2) |
+| **0.20** | **clean** | **clean** |
+
+**Recommended robust controlnet strength = 0.20** (0.05 of margin above the 0.15
+non-deterministic borderline); both photoreal survivors cleared at 0.20. Honest
+caveat: 0.20 is one confirming run WITH margin, not an N-run repeatability proof --
+for a removal service, add a little more margin or validate repeatability, since
+there is no local SynthID detector to self-check. **Implications:** (1) the
+content×pipeline table above conflates a borderline/non-deterministic 0.15 result
+with deterministic content behavior -- the photoreal-survives-controlnet effect is
+solid at 0.10 but at 0.15 it is near-threshold noise; (2) for reliable removal pick
+a strength with MARGIN above the borderline (controlnet >= 0.20), not exactly on
+it; (3) **engineering follow-up for raiw.cc: the controlnet pipeline should use a
+HIGHER vendor strength than `default` (it currently shares `resolve_strength`) --
+e.g. controlnet floor 0.20 -- calibrated per vendor/content on the GPU worker where
+batches are cheap. The shared 0.10/0.15 is tuned for `default`, not controlnet.**
+Source images are private (faces / product shots), not committed; reproduce on any
+photoreal + flat-graphic gpt-image pair, varying the seed, and re-checking the
+oracle.
+
+**Gemini pass + the face-restore re-introduction (2026-06-04).** Four Gemini
+originals via `--auto` (controlnet) at `--max-resolution 1024`, checked on the
+Gemini "Verify with SynthID" oracle (Google content needs the Google oracle, not
+openai.com/verify):
+- Most cleared at controlnet 0.15-0.25; `gemini_3` (a large central FACE, +restore)
+  stayed **SynthID-detected at controlnet 0.15, 0.20 AND 0.25** -- raising strength
+  did not crack it.
+- **Root cause was the face-restore pass, not strength/resolution.** `gemini_3` at
+  controlnet 0.20 with `--no-restore-faces` read **SynthID-NOT-detected** (clean
+  A/B, only restore differed). GFPGAN runs on the ORIGINAL watermarked face and at
+  weight 0.5 blends ~half its pixels back, re-introducing SynthID into the
+  composited face over the diffusion-cleaned result (see §5.1 face-identity bullet).
+- (Side note: reducing the processing resolution does NOT weaken SynthID -- it is
+  robust to downscaling by design, and the study's resolution trend says LOWER
+  processing res needs LESS strength, so 1024 was never the wall.)
+
+**Net for raiw.cc:** (1) controlnet needs a higher, per-vendor strength than
+`default` (OpenAI ~0.20, Gemini >= ~0.20-0.25), oracle-calibrated; (2) the
+`--restore-faces` pass can re-add SynthID and must be reworked (restore on the
+cleaned image / lower weight / off) before it is safe in a removal pipeline; (3)
+removal near threshold is seed-non-deterministic, so use margin.
 
 ---
 
