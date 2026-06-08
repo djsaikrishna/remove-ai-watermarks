@@ -2288,6 +2288,7 @@ lama = [
     { name = "onnxruntime", version = "1.26.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 photomaker = [
+    { name = "einops" },
     { name = "huggingface-hub" },
     { name = "photomaker" },
 ]
@@ -2300,6 +2301,7 @@ requires-dist = [
     { name = "accelerate", marker = "extra == 'gpu'", specifier = ">=0.25.0" },
     { name = "click", specifier = ">=8.0.0" },
     { name = "diffusers", marker = "extra == 'gpu'", specifier = ">=0.38.0" },
+    { name = "einops", marker = "extra == 'photomaker'", specifier = ">=0.7.0" },
     { name = "huggingface-hub", marker = "extra == 'lama'", specifier = ">=0.20.0" },
     { name = "huggingface-hub", marker = "extra == 'photomaker'", specifier = ">=0.20.0" },
     { name = "invisible-watermark", marker = "extra == 'detect'", specifier = ">=0.2.0" },

@@ -91,6 +91,10 @@ lama = [
 photomaker = [
     "photomaker @ git+https://github.com/TencentARC/PhotoMaker.git",
     "huggingface-hub>=0.20.0",
+    # Upstream PhotoMaker imports `einops` but doesn't declare it in its install_requires
+    # (verified 2026-06-04: cert sweep failed with "No module named 'einops'"). Pin it
+    # here so the extra is self-contained.
+    "einops>=0.7.0",
 ]
 # Optional pre-diffusion super-resolution for small inputs (Real-ESRGAN). Loaded via
 # spandrel (MIT) -- a pure model-loader with NO basicsr dependency (it pulls only
