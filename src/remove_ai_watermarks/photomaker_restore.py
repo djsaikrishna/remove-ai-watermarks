@@ -1,4 +1,4 @@
-"""SynthID-robust face identity restoration via PhotoMaker-V2.
+"""SynthID-robust face identity restoration via PhotoMaker-V1.
 
 The diffusion removal pass scrubs the pixel watermark from the WHOLE image, including
 faces, but lets faces drift in identity. Unlike the GFPGAN restore pass in
@@ -14,11 +14,16 @@ empirically confirmed 2026-06-04: on 31 face crops, the cosine similarity betwee
 SynthID magnitude) is 0.9977 -- an order of magnitude less drift than JPEG90, which
 SynthID survives at >=99% TPR by design. See ``docs/synthid-robust-identity-research.md``.
 
-Architecture: PhotoMaker-V2 is a fine-tuned OpenCLIP-ViT-H/14 ID encoder plus LoRA on
-the SDXL UNet attention layers. It ships as a single ``photomaker-v2.bin`` checkpoint
-loaded into a ``PhotoMakerStableDiffusionXLPipeline`` (txt2img only -- there is no
-PhotoMakerControlNetImg2img class in diffusers). We use it as a SECOND PASS after the
-main controlnet/default removal:
+Architecture: PhotoMaker-V1 is a fine-tuned OpenCLIP-ViT-H/14 ID encoder plus LoRA on
+the SDXL UNet attention layers. It ships as a single ``photomaker-v1.bin`` checkpoint
+loaded into a ``PhotoMakerStableDiffusionXLPipeline`` (txt2img). **V1, not V2:** V2
+adds an InsightFace/ArcFace face-recognition component at runtime, whose pretrained
+model packs (antelopev2, buffalo_l) are non-commercial-research-only per the
+InsightFace README, which would block a paid service like raiw.cc. V1's identity
+encoder is CLIP-only (PhotoMakerIDEncoder, ``model.py``); confirmed by inspecting
+the upstream source (model_v2.py forward takes ``id_embeds`` from InsightFace; V1
+forward does not). We use it as a SECOND PASS after the main controlnet/default
+removal:
 
   1. Main removal pass (`controlnet` at the certified strength) cleans SynthID
      everywhere but leaves faces drifted.
@@ -31,11 +36,12 @@ The generated face pixels are diffusion-fresh and inherit identity from the embe
 (not the pixels), so SynthID is not re-introduced.
 
 Commercial-safe end-to-end:
-- PhotoMaker-V2 weights: Apache-2.0 (TencentARC).
+- PhotoMaker-V1 weights: Apache-2.0 (TencentARC).
 - ID encoder: OpenCLIP-ViT-H/14 (MIT) finetuned by PhotoMaker (still Apache-2.0).
 - SDXL base: shared with the main pipeline (already used in `default`/`controlnet`).
-- NO InsightFace / antelopev2 (which is the non-commercial blocker for IP-Adapter
-  FaceID / InstantID / PuLID / Arc2Face).
+- NO InsightFace / antelopev2 (the non-commercial blocker that BLOCKS PhotoMaker-V2,
+  IP-Adapter FaceID, InstantID, PuLID, and Arc2Face). V1 is the only commercial-safe
+  member of this family.
 
 Requires the optional ``photomaker`` extra: ``pip install
 'remove-ai-watermarks[photomaker]'`` (pulls torch / diffusers / the upstream PhotoMaker
@@ -57,9 +63,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# PhotoMaker-V2 weights (Apache-2.0, TencentARC). Downloaded on first use.
-_PHOTOMAKER_REPO = "TencentARC/PhotoMaker-V2"
-_PHOTOMAKER_FILE = "photomaker-v2.bin"
+# PhotoMaker-V1 weights (Apache-2.0, TencentARC). Downloaded on first use. V2 is NOT
+# used because it pulls InsightFace at runtime (non-commercial models).
+_PHOTOMAKER_REPO = "TencentARC/PhotoMaker"
+_PHOTOMAKER_FILE = "photomaker-v1.bin"
 # SDXL base shared with the main pipeline (same checkpoint as `default`/`controlnet`).
 _SDXL_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
 

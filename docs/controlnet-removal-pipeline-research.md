@@ -124,7 +124,7 @@ Gemini app; the two payloads are vendor-specific and never cross-checked):
 - **Fix the seed in prod.** The non-determinism is purely `seed=None` (random); a fixed
   `--seed` makes every run reproduce the certified-clean result, so you ship a
   deterministic, re-certifiable config (and the seed sweep collapses to one config).
-- **`--restore-faces` is SynthID-safe by construction now (PhotoMaker-V2, 2026-06-04).**
+- **`--restore-faces` is SynthID-safe by construction now (PhotoMaker-V1, 2026-06-04).**
   The GFPGAN-on-original path that re-added SynthID was removed; the shipped restore
   carries identity in a SynthID-invariant OpenCLIP embedding and regenerates fresh
   pixels conditioned on it. Needs the `photomaker` extra. See

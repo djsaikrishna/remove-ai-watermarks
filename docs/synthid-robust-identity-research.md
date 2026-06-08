@@ -10,12 +10,25 @@ the face embedder it conditions on AND any base model) must be Apache-2.0 / MIT 
 BSD or otherwise clearly commercial-permitted. Non-commercial is disqualifying.
 
 **One-line verdict.** Today there is **ONE** SDXL identity-conditioning stack that
-is commercial-safe end-to-end: **PhotoMaker-V2** (Apache-2.0, identity encoded as a
+is commercial-safe end-to-end: **PhotoMaker-V1** (Apache-2.0, identity encoded as a
 fine-tuned OpenCLIP-ViT-H/14 image embedding -- NO InsightFace). Every other
-candidate (IP-Adapter FaceID family, InstantID, PuLID, Arc2Face) inherits
-InsightFace's non-commercial model-pack license through its ArcFace-class embedder
-and is therefore blocked for paid services, regardless of the adapter's own
-license header. Below is the evidence per component and the integration plan.
+candidate -- **including PhotoMaker-V2**, IP-Adapter FaceID, InstantID, PuLID,
+Arc2Face -- inherits InsightFace's non-commercial model-pack license through an
+ArcFace-class embedder and is therefore blocked for paid services, regardless of
+the adapter's own license header. Below is the evidence per component and the
+integration plan.
+
+**Correction notice (2026-06-04).** An earlier version of this doc claimed
+PhotoMaker-V2 was commercial-safe end-to-end. That was WRONG -- the V2 model card
+phrase *"id_encoder includes finetuned OpenCLIP-ViT-H-14 and a few fuse layers"*
+described one of TWO ID branches; the V2 source (model_v2.py) defines
+`PhotoMakerIDEncoder_CLIPInsightfaceExtendtoken` whose forward takes an
+ArcFace `id_embeds` from `insightface.app.FaceAnalysis`, and the upstream package
+`__init__.py` imports InsightFace at module load. A Modal cert sweep caught this
+empirically (`No module named 'insightface'` from `restore_faces_photomaker`). V1
+is the correct commercial-safe target: its `PhotoMakerIDEncoder` (model.py)
+forward takes only `(id_pixel_values, prompt_embeds, class_tokens_mask)` -- no
+ArcFace branch -- so identity is CLIP-only.
 
 ## 1. Why identity-by-embedding (not by pixel) is the only SynthID-robust path
 
@@ -44,7 +57,8 @@ the watermark is not transported. Two embedding families exist in practice:
 
 | stack | adapter weights | identity encoder | end-to-end commercial-safe? |
 |---|---|---|---|
-| **PhotoMaker-V2** | **Apache-2.0** ([HF model card][pm2hf]) | **OpenCLIP-ViT-H/14 (MIT)** finetuned, see card: *"id_encoder includes finetuned OpenCLIP-ViT-H-14 and a few fuse layers"* | **YES** |
+| **PhotoMaker-V1** | **Apache-2.0** ([HF][pmhf]) | **OpenCLIP-ViT-H/14 (MIT)** finetuned, identity from `PhotoMakerIDEncoder` (`model.py`); forward takes only ``(id_pixel_values, prompt_embeds, class_tokens_mask)`` -- no ArcFace branch | **YES** |
+| PhotoMaker-V2 | Apache-2.0 (adapter) ([HF][pm2hf]) | DUAL encoder: OpenCLIP-ViT-H/14 AND InsightFace antelopev2/buffalo_l -- `PhotoMakerIDEncoder_CLIPInsightfaceExtendtoken` (`model_v2.py`) forward takes `id_embeds` from `insightface.app.FaceAnalysis`, and `photomaker/__init__.py` imports InsightFace at module load | NO -- InsightFace pack is non-commercial |
 | IP-Adapter FaceID | non-commercial per model card: *"AS InsightFace pretrained models are available for non-commercial research purposes, IP-Adapter-FaceID models are released exclusively for research purposes and is not intended for commercial use"* ([HF][ipafhf]) | InsightFace antelopev2 (non-commercial for the model pack) | NO -- both layers block |
 | InstantID | Apache-2.0 (adapter only) ([HF][insthf]) | requires InsightFace antelopev2 face-analysis at runtime (`FaceAnalysis(name='antelopev2', ...)` per the README usage snippet, [HF][insthf]) | NO -- embedder pack is non-commercial |
 | PuLID | apache-2.0 (HF model metadata, [HF][pulidhf]) | depends on InsightFace face-analysis for ArcFace embedding (per the upstream README; PuLID's own card is sparse and the GitHub README documents the InsightFace install step) | NO -- same embedder issue as IP-Adapter FaceID |
@@ -66,6 +80,7 @@ weights but the upstream repo's quickstart requires the InsightFace package to
 extract the ID embedding. So PuLID's adapter license is permissive; the BLOCKER
 is the embedder it expects at runtime. This is the same trap as InstantID.)
 
+[pmhf]: https://huggingface.co/TencentARC/PhotoMaker
 [pm2hf]: https://huggingface.co/TencentARC/PhotoMaker-V2
 [ipafhf]: https://huggingface.co/h94/IP-Adapter-FaceID
 [insthf]: https://huggingface.co/InstantX/InstantID
@@ -87,7 +102,7 @@ but you would need:
 
 For a removal service this is a multi-month side project that delivers what
 PhotoMaker already gives us with one pip install. So the practical answer is to
-take the CLIP-embedding path (PhotoMaker-V2), accept the identity-fidelity
+take the CLIP-embedding path (PhotoMaker-V1; V2 adds InsightFace and is non-commercial), accept the identity-fidelity
 trade-off, and revisit ArcFace later if quality is insufficient.
 
 ## 4. Does an identity embedding leak SynthID?
@@ -109,7 +124,7 @@ This is the load-bearing assumption of the whole approach. The argument:
 **MEASURED 2026-06-04 — hypothesis confirmed.** Ran a low-amplitude
 perturbation sweep on 31 face crops (3 photoreal originals: gemini_3, gemini_4,
 openai_3 grid), comparing `cos(embedding(orig), embedding(perturbed))` for OpenCLIP-
-ViT-H/14 (laion2B-s32B-b79K, the same encoder PhotoMaker-V2 finetunes):
+ViT-H/14 (laion2B-s32B-b79K, the same OpenCLIP-ViT-H/14 encoder PhotoMaker V1 and V2 both finetune for CLIP-side identity):
 
 | perturbation | mean cos | min | max |
 |---|---|---|---|
@@ -123,7 +138,7 @@ ViT-H/14 (laion2B-s32B-b79K, the same encoder PhotoMaker-V2 finetunes):
 The SynthID-magnitude perturbation moves the embedding by **0.002** (cosine 0.9977),
 an order of magnitude less than JPEG90 — which SynthID survives at >=99% TPR by
 design. So the embedding cannot carry the watermark pattern: its discriminative
-signal is in dimensions the SynthID payload does not occupy. PhotoMaker-V2
+signal is in dimensions the SynthID payload does not occupy. PhotoMaker-V1
 conditioned on a watermarked face will see ~the same identity vector as if
 conditioned on a clean face of the same person, so the freshly generated face
 inherits the identity, not the watermark.
@@ -136,7 +151,7 @@ synthid_proxy result above is the one that actually answers the load-bearing
 question. Script: `/tmp/identity_smoke/test2_proxy.py` (not committed; reproducible
 from the test set + this doc).
 
-## 5. PhotoMaker-V2 properties for our pipeline
+## 5. PhotoMaker-V1 properties for our pipeline
 
 - **SDXL-native.** PhotoMaker v1 and v2 target Stable Diffusion XL; the pipeline
   is a stacked-ID embedding fused into SDXL's cross-attention via the fuse layers
@@ -166,9 +181,9 @@ from the test set + this doc).
 - New deps: `diffusers` already in the gpu extra; PhotoMaker ships as a `.bin`
   loaded via `pipeline.load_photomaker_adapter(...)`. The OpenCLIP encoder is the
   same one diffusers already pulls. No new heavy pip dep.
-- Weight download: PhotoMaker-V2 weights are ~3 GB. Add to the Modal HF volume
+- Weight download: PhotoMaker-V1 weights are ~3 GB. Add to the Modal HF volume
   alongside SDXL.
-- VRAM: SDXL + canny ControlNet + PhotoMaker-V2 fits comfortably in A100-40GB.
+- VRAM: SDXL + canny ControlNet + PhotoMaker-V1 fits comfortably in A100-40GB.
 - Latency: a few extra seconds on cold start (load PhotoMaker), negligible per
   request after warm-up.
 - No InsightFace install: huge win for `restore` extra's basicsr/numpy hell --
@@ -184,7 +199,7 @@ from the test set + this doc).
    - If yes -> the embedding does not carry SynthID, proceed.
    - If no -> the assumption is wrong; PhotoMaker would re-introduce the
      watermark. Stop and reconsider.
-2. **PhotoMaker-V2 prototype** in the existing `controlnet` pipeline:
+2. **PhotoMaker-V1 prototype** in the existing `controlnet` pipeline:
    - Mirror the `_load_controlnet_pipeline` path: add a PhotoMaker variant that
      loads SDXL + canny ControlNet + PhotoMaker adapter on the same engine.
    - Extract the OpenCLIP face embedding from the watermarked face crops (use
