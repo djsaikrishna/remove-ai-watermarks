@@ -287,9 +287,12 @@ def _get_pipeline() -> Any:
             pipe.to(device)
             # IP-Adapter weights that wire the ArcFace embedding into cross-attention.
             ip_adapter_path = hf_hub_download(repo_id=_INSTANTID_REPO, filename=_INSTANTID_IP_ADAPTER)
-            # IP-Adapter scale (the weight on the ArcFace cross-attention branch) is
-            # set at load time, not at call time. 0.8 mirrors the upstream demo.
-            pipe.load_ip_adapter_instantid(ip_adapter_path, scale=0.8)
+            # IP-Adapter scale = weight on the ArcFace cross-attention. The upstream
+            # demo uses 0.8 for txt2img; for img2img-on-cleaned we push to 1.0 because
+            # the cleaned face crop is competing as identity prior and we want ArcFace
+            # to dominate (otherwise the regenerated face inherits the controlnet-
+            # drifted cleaned face, not the original identity).
+            pipe.load_ip_adapter_instantid(ip_adapter_path, scale=1.0)
             # Diffusers 0.38 vs InstantID upstream compat patch: InstantID's __call__
             # calls ``self.check_inputs(...)`` POSITIONALLY (signature from ~v0.29),
             # but diffusers 0.38 added two new params (``ip_adapter_image``,
@@ -365,8 +368,8 @@ def restore_faces_instantid(
     cleaned_bgr: NDArray[Any],
     num_inference_steps: int = 30,
     guidance_scale: float = 5.0,
-    controlnet_conditioning_scale: float = 0.8,
-    img2img_strength: float = 0.55,
+    controlnet_conditioning_scale: float = 1.0,
+    img2img_strength: float = 0.7,
     seed: int | None = None,
     detect_faces_fn: Any | None = None,
 ) -> NDArray[Any]:
