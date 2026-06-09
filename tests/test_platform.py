@@ -20,7 +20,6 @@ from remove_ai_watermarks.noai.watermark_profiles import (
     GEMINI_STRENGTH,
     OPENAI_STRENGTH,
     UNKNOWN_STRENGTH,
-    get_model_id_for_profile,
     normalize_profile,
     resolve_strength,
     strength_default_help,
@@ -111,24 +110,19 @@ class TestMpsErrorDetection:
 
 
 class TestModelProfiles:
-    """Tests for watermark_profiles.py."""
+    """Tests for watermark_profiles.py profile-name normalization."""
 
-    def test_sdxl_profile(self):
-        assert get_model_id_for_profile("sdxl") == "stabilityai/stable-diffusion-xl-base-1.0"
+    def test_canonical_profiles_unchanged(self):
+        assert normalize_profile("sdxl") == "sdxl"
+        assert normalize_profile("controlnet") == "controlnet"
 
     def test_default_alias_resolves_to_sdxl(self):
         # "default" is the legacy alias for "sdxl" (back-compat for existing scripts).
-        assert get_model_id_for_profile("default") == "stabilityai/stable-diffusion-xl-base-1.0"
         assert normalize_profile("default") == "sdxl"
-        assert normalize_profile("controlnet") == "controlnet"
 
-    def test_controlnet_profile(self):
-        # controlnet shares the SDXL base checkpoint (the ControlNet is an add-on).
-        assert get_model_id_for_profile("controlnet") == "stabilityai/stable-diffusion-xl-base-1.0"
-
-    def test_unknown_profile_raises(self):
-        with pytest.raises(ValueError, match="Unknown model profile"):
-            get_model_id_for_profile("nonexistent")
+    def test_normalize_is_case_and_whitespace_insensitive(self):
+        assert normalize_profile("  Default ") == "sdxl"
+        assert normalize_profile("CONTROLNET") == "controlnet"
 
 
 class TestResolveStrength:

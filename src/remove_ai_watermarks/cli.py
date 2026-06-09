@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 
     from numpy.typing import NDArray
 
-    from remove_ai_watermarks.gemini_engine import DetectionResult
 
 # --- plain-text output layer (replaces rich: no colors, no markup, no boxes) ---
 
@@ -291,15 +290,32 @@ def _warn_if_esrgan_unavailable(upscaler: str) -> None:
         console.print("  Note: --upscaler esrgan needs the 'esrgan' extra; falling back to Lanczos.")
 
 
-def _watermark_region(det: DetectionResult, width: int, height: int) -> tuple[int, int, int, int]:
-    """Pick a watermark bbox: detector's region if confident, else the default config slot."""
-    if det.confidence > 0.15:
-        return det.region
-    from remove_ai_watermarks.gemini_engine import get_watermark_config
+def _remove_visible_auto(
+    image: NDArray[Any],
+    *,
+    inpaint: bool = True,
+    inpaint_method: str = "ns",
+    inpaint_strength: float = 0.85,
+) -> tuple[NDArray[Any], str | None]:
+    """Remove the strongest auto-detected visible mark via the registry.
 
-    config = get_watermark_config(width, height)
-    px, py = config.get_position(width, height)
-    return (px, py, config.logo_size, config.logo_size)
+    Routes the ``all``/``batch`` visible step through the same registry path the
+    standalone ``visible`` command uses, so EVERY registered mark is handled (the
+    Gemini sparkle AND the Doubao/Jimeng/Samsung text marks), not just the sparkle.
+    Returns ``(result, label-or-None)``; when no ``in_auto`` mark fires the image is
+    returned unchanged with ``None``. ``inpaint*`` tune the Gemini edge-residual
+    cleanup only (the text engines ignore them).
+    """
+    from remove_ai_watermarks import watermark_registry
+
+    best = watermark_registry.best_auto_mark(image)
+    if best is None:
+        return image, None
+    method: Literal["telea", "ns"] = "ns" if inpaint_method == "ns" else "telea"
+    result, _ = watermark_registry.get_mark(best.key).remove(
+        image, inpaint_method=method, inpaint=inpaint, inpaint_strength=inpaint_strength, force=False
+    )
+    return result, best.label
 
 
 def _read_bgr_and_alpha(path: Path) -> tuple[NDArray[Any] | None, NDArray[Any] | None]:
@@ -893,8 +909,6 @@ def cmd_all(
 
     If invisible watermark deps are not installed, skips step 2 with a warning.
     """
-    from remove_ai_watermarks.gemini_engine import GeminiEngine
-
     _banner()
     source = _validate_image(source)
     _warn_if_esrgan_unavailable(upscaler)
@@ -918,7 +932,6 @@ def cmd_all(
 
         # -- Step 1: Visible watermark --------------------------------
         console.print("\n  1) Visible watermark removal")
-        engine = GeminiEngine()
         image, alpha = _read_bgr_and_alpha(source)
         if image is None:
             console.print(f"Error: Failed to read image: {source}")
@@ -928,15 +941,10 @@ def cmd_all(
         console.print(f"    Input: {source.name}  ({w}x{h})")
 
         with console.status("Removing visible watermark..."):
-            det = engine.detect_watermark(image)
-            if det.detected:
-                result = engine.remove_watermark(image)
-                if inpaint:
-                    region = _watermark_region(det, w, h)
-                    result = engine.inpaint_residual(result, region, method=inpaint_method)
-                console.print("    Visible watermark removed")
+            result, removed_label = _remove_visible_auto(image, inpaint=inpaint, inpaint_method=inpaint_method)
+            if removed_label is not None:
+                console.print(f"    Visible watermark removed ({removed_label})")
             else:
-                result = image.copy()
                 console.print("    Skipped (no visible watermark detected)")
 
         # Save to temp file for invisible engine input (preserve alpha if present)
@@ -1058,27 +1066,15 @@ def _process_batch_image(
     saved_alpha: NDArray[Any] | None = None
 
     if mode in ("visible", "all"):
-        from remove_ai_watermarks.gemini_engine import GeminiEngine
-
-        if "_vis_engine" not in ctx.obj:
-            ctx.obj["_vis_engine"] = GeminiEngine()
-        engine = ctx.obj["_vis_engine"]
-        read_path = img_path
-        if mode == "all" and out_path.exists():
-            read_path = out_path
-        image, alpha = _read_bgr_and_alpha(read_path)
+        # Always read the ORIGINAL source: the visible pass is the first step, so a
+        # stale out_path from a previous run must not be re-processed as if it were
+        # the input. (The invisible step below reads out_path for `all` -- that chain
+        # is within a single run.)
+        image, alpha = _read_bgr_and_alpha(img_path)
         if image is None:
             raise ValueError("Failed to read image")
 
-        det = engine.detect_watermark(image)
-        if det.detected:
-            result = engine.remove_watermark(image)
-            if inpaint:
-                h, w = image.shape[:2]
-                region = _watermark_region(det, w, h)
-                result = engine.inpaint_residual(result, region)
-        else:
-            result = image.copy()
+        result, _ = _remove_visible_auto(image, inpaint=inpaint)
 
         _write_bgr_with_alpha(out_path, result, alpha)
         saved_alpha = alpha

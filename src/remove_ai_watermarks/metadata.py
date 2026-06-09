@@ -9,6 +9,7 @@ For metadata-only operations, the heavy ML dependencies are NOT required.
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import re
 import struct
@@ -209,7 +210,10 @@ def _png_late_metadata(image_path: Path, window: int) -> bytes:
                 if chunk_type in _PNG_META_CHUNKS and data_start >= window:
                     f.seek(data_start)
                     out += f.read(safe_length)
-                pos = data_start + length + 4  # data + CRC
+                # Advance by the CLAMPED length: a malformed/inflated `length` that
+                # overshoots EOF must not push `pos` past the file and abort the scan
+                # (which would silently skip a genuine AI-label chunk after it).
+                pos = data_start + safe_length + 4  # data + CRC
     except OSError as exc:
         logger.debug("PNG late-metadata scan failed on %s: %s", image_path, exc)
         return b""
@@ -227,7 +231,29 @@ def scan_head(image_path: Path, size: int = 1024 * 1024) -> bytes:
     non-faststart MP4 manifest, or a PNG XMP packet appended after the pixels --
     which a fixed first-MB read would miss. For other inputs, and for files that
     fit within ``size``, it is exactly ``f.read(size)`` -- behavior-neutral.
+
+    The result is memoized per (path, size, mtime): one ``identify``/``get_ai_metadata``
+    call fans out to ~8 byte-scan detectors that each call this on the same file, so
+    the cache turns those repeated reads into one. The mtime key invalidates the entry
+    when the file changes; the small ``maxsize`` bounds memory to a few MB.
     """
+    try:
+        mtime = image_path.stat().st_mtime_ns
+    except OSError:
+        # No stat (e.g. a pipe, or a race): read uncached rather than fail.
+        return _scan_head_impl(image_path, size)
+    return _scan_head_cached(str(image_path), size, mtime)
+
+
+@functools.lru_cache(maxsize=8)
+def _scan_head_cached(path_str: str, size: int, _mtime_ns: int) -> bytes:
+    """Cache shim: ``_mtime_ns`` is part of the key only (invalidates on change)."""
+    from pathlib import Path as _Path
+
+    return _scan_head_impl(_Path(path_str), size)
+
+
+def _scan_head_impl(image_path: Path, size: int) -> bytes:
     with open(image_path, "rb") as f:
         head = f.read(size)
     # Lazy import: isobmff imports this module's constants at top level.

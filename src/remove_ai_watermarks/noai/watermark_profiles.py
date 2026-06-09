@@ -16,7 +16,6 @@ DEFAULT_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
 # profile is ``sdxl``; ``default`` is kept as an accepted alias (it was the profile's
 # name before ``controlnet`` became the default-selected pipeline, 2026-06-09).
 SDXL_PROFILE = "sdxl"
-CONTROLNET_PROFILE = "controlnet"
 _PROFILE_ALIASES = {"default": SDXL_PROFILE}
 
 
@@ -119,16 +118,3 @@ def vendor_for_strength(image_path: Path) -> Literal["openai", "google"] | None:
     if "openai" in src:
         return "openai"
     return None
-
-
-def get_model_id_for_profile(profile: str) -> str:
-    """Map CLI model profile names to concrete Hugging Face model IDs.
-
-    Both ``sdxl`` and ``controlnet`` use the SDXL base checkpoint -- the canny
-    ControlNet (``CONTROLNET_CANNY_MODEL``) is an add-on loaded on top of it, not a
-    separate base model. The legacy ``default`` alias resolves to ``sdxl``.
-    """
-    normalized = normalize_profile(profile)
-    if normalized in (SDXL_PROFILE, CONTROLNET_PROFILE):
-        return DEFAULT_MODEL_ID
-    raise ValueError(f"Unknown model profile '{profile}'. Use one of: sdxl, controlnet.")

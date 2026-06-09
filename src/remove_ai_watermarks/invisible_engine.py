@@ -261,8 +261,14 @@ class InvisibleEngine:
                 vendor=vendor,
             )
 
-            # Post-processing: optional Humanizer, then restore original resolution.
-            if humanize > 0.0:
+            # Post-processing chain: decode the diffusion output ONCE, apply the
+            # optional stages in memory in order (humanize -> restore original
+            # resolution -> unsharp -> adaptive polish), and write ONCE. Previously
+            # each stage independently imread/imwrote the full-res output, so a run
+            # with several stages PNG-decoded+re-encoded the same image 2-4 times.
+            # PNG is lossless, so the single-write output is byte-identical.
+            needs_restore = target is not None  # the input was resized before diffusion
+            if humanize > 0.0 or unsharp > 0.0 or adaptive_polish or needs_restore:
                 import cv2
 
                 from remove_ai_watermarks import image_io
@@ -271,67 +277,43 @@ class InvisibleEngine:
                 if out_cv is None:
                     return out_path
 
-                if self._progress_callback:
-                    self._progress_callback(f"Applying Analog Humanizer (grain: {humanize})...")
-                from remove_ai_watermarks.humanizer import apply_analog_humanizer
+                if humanize > 0.0:
+                    if self._progress_callback:
+                        self._progress_callback(f"Applying Analog Humanizer (grain: {humanize})...")
+                    from remove_ai_watermarks.humanizer import apply_analog_humanizer
 
-                out_cv = apply_analog_humanizer(out_cv, grain_intensity=humanize, chromatic_shift=1)
+                    out_cv = apply_analog_humanizer(out_cv, grain_intensity=humanize, chromatic_shift=1)
 
-                # Restore original resolution
+                # Restore original resolution if the input was resized for diffusion.
                 if (out_cv.shape[1], out_cv.shape[0]) != orig_size:
                     if self._progress_callback:
                         self._progress_callback(
                             f"Upscaling result back to original resolution {orig_size[0]}x{orig_size[1]}..."
                         )
-                    # Using INTER_LANCZOS4 for high-quality upscaling back to original
                     out_cv = cv2.resize(out_cv, orig_size, interpolation=cv2.INTER_LANCZOS4)
 
-                image_io.imwrite(out_path, out_cv)
-
-            else:
-                # No humanize: still restore the original size if it was capped.
-                import cv2
-
-                from remove_ai_watermarks import image_io
-
-                out_cv = image_io.imread(out_path, cv2.IMREAD_COLOR)
-                if out_cv is not None and (out_cv.shape[1], out_cv.shape[0]) != orig_size:
-                    if self._progress_callback:
-                        self._progress_callback(
-                            f"Upscaling result back to original resolution {orig_size[0]}x{orig_size[1]}..."
-                        )
-                    out_cv = cv2.resize(out_cv, orig_size, interpolation=cv2.INTER_LANCZOS4)
-                    image_io.imwrite(out_path, out_cv)
-
-            # Final sharpening.
-            if unsharp > 0.0:
-                import cv2
-
-                from remove_ai_watermarks import image_io
-                from remove_ai_watermarks.humanizer import unsharp_mask
-
-                out_cv = image_io.imread(out_path, cv2.IMREAD_COLOR)
-                if out_cv is not None:
+                if unsharp > 0.0:
                     if self._progress_callback:
                         self._progress_callback(f"Sharpening (unsharp mask: {unsharp})...")
-                    image_io.imwrite(out_path, unsharp_mask(out_cv, amount=unsharp))
+                    from remove_ai_watermarks.humanizer import unsharp_mask
 
-            # Adaptive polish (CLI default): restore the input's detail level in the
-            # softened output, sparing text/edges. Self-limiting where there is no deficit.
-            if adaptive_polish:
-                import cv2
-                import numpy as np
+                    out_cv = unsharp_mask(out_cv, amount=unsharp)
 
-                from remove_ai_watermarks import humanizer, image_io
+                # Adaptive polish (CLI default): restore the input's detail level in the
+                # softened output, sparing text/edges. Self-limiting where no deficit.
+                if adaptive_polish:
+                    import numpy as np
 
-                out_cv = image_io.imread(out_path, cv2.IMREAD_COLOR)
-                if out_cv is not None:
+                    from remove_ai_watermarks import humanizer
+
                     ref = cv2.cvtColor(np.array(reference_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
                     if (ref.shape[1], ref.shape[0]) != (out_cv.shape[1], out_cv.shape[0]):
                         ref = cv2.resize(ref, (out_cv.shape[1], out_cv.shape[0]), interpolation=cv2.INTER_LANCZOS4)
                     if self._progress_callback:
                         self._progress_callback("Adaptive polish (sharpen + grain to the input's detail level)...")
-                    image_io.imwrite(out_path, humanizer.adaptive_polish(out_cv, ref, seed=seed))
+                    out_cv = humanizer.adaptive_polish(out_cv, ref, seed=seed)
+
+                image_io.imwrite(out_path, out_cv)
 
             return out_path
         finally:

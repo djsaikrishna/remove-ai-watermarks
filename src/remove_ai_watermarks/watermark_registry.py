@@ -159,71 +159,45 @@ def _gemini_remove(
     return result, det.region
 
 
-def _doubao_detect(image: NDArray[Any]) -> MarkDetection:
-    d = _engine("doubao").detect(image)
-    return MarkDetection("doubao", "Doubao 豆包AI生成 text", "bottom-right", d.detected, d.confidence, d.region)
+# The three text-mark engines (Doubao/Jimeng/Samsung) share the TextMarkEngine
+# interface, so one parameterized adapter pair drives all of them -- a new
+# reverse-alpha text mark is one `_text_mark(...)` row below, not another copy-paste
+# of these bodies. Removal is reverse-alpha only: applied when the mark is detected
+# (or forced) and the alpha asset loads, otherwise skipped (no hallucination on a
+# clean corner).
+def _text_mark_detect(key: str, label: str, location: str) -> Callable[[NDArray[Any]], MarkDetection]:
+    def detect(image: NDArray[Any]) -> MarkDetection:
+        d = _engine(key).detect(image)
+        return MarkDetection(key, label, location, d.detected, d.confidence, d.region)
+
+    return detect
 
 
-def _doubao_remove(
-    image: NDArray[Any], _inpaint_method: InpaintMethod, _inpaint: bool, _strength: float, force: bool
-) -> tuple[NDArray[Any], Region | None]:
-    # Reverse-alpha only: apply when the mark is present AND the resolution is in
-    # the alpha map's calibrated band. Outside it we do NOT inpaint (no
-    # hallucination) -- removal is skipped until a capture for that resolution.
-    engine = _engine("doubao")
-    det = engine.detect(image)
-    if (det.detected or force) and engine.reverse_alpha_available(image):
-        return engine.remove_watermark_reverse_alpha(image), (det.region if det.detected else None)
-    return image.copy(), None
+def _text_mark_remove(key: str) -> Callable[..., tuple[NDArray[Any], Region | None]]:
+    def remove(
+        image: NDArray[Any], _inpaint_method: InpaintMethod, _inpaint: bool, _strength: float, force: bool
+    ) -> tuple[NDArray[Any], Region | None]:
+        engine = _engine(key)
+        det = engine.detect(image)
+        if (det.detected or force) and engine.reverse_alpha_available(image):
+            return engine.remove_watermark_reverse_alpha(image), (det.region if det.detected else None)
+        return image.copy(), None
+
+    return remove
 
 
-def _jimeng_detect(image: NDArray[Any]) -> MarkDetection:
-    d = _engine("jimeng").detect(image)
-    return MarkDetection("jimeng", "Jimeng 即梦AI wordmark", "bottom-right", d.detected, d.confidence, d.region)
-
-
-def _jimeng_remove(
-    image: NDArray[Any], _inpaint_method: InpaintMethod, _inpaint: bool, _strength: float, force: bool
-) -> tuple[NDArray[Any], Region | None]:
-    # Reverse-alpha (with an always-on residual inpaint over the glyph footprint,
-    # see the engine): apply when the mark is present and the alpha asset loads.
-    # Skipped otherwise (no hallucination on a clean corner).
-    engine = _engine("jimeng")
-    det = engine.detect(image)
-    if (det.detected or force) and engine.reverse_alpha_available(image):
-        return engine.remove_watermark_reverse_alpha(image), (det.region if det.detected else None)
-    return image.copy(), None
-
-
-def _samsung_detect(image: NDArray[Any]) -> MarkDetection:
-    d = _engine("samsung").detect(image)
-    return MarkDetection("samsung", "Samsung Galaxy AI text", "bottom-left", d.detected, d.confidence, d.region)
-
-
-def _samsung_remove(
-    image: NDArray[Any], _inpaint_method: InpaintMethod, _inpaint: bool, _strength: float, force: bool
-) -> tuple[NDArray[Any], Region | None]:
-    # Reverse-alpha (with an always-on thin residual inpaint over the glyph
-    # footprint, see the engine): apply when the mark is present and the alpha asset
-    # loads. Skipped otherwise (no hallucination on a clean corner).
-    engine = _engine("samsung")
-    det = engine.detect(image)
-    if (det.detected or force) and engine.reverse_alpha_available(image):
-        return engine.remove_watermark_reverse_alpha(image), (det.region if det.detected else None)
-    return image.copy(), None
+def _text_mark(key: str, label: str, location: str) -> KnownMark:
+    """A reverse-alpha text-mark registry row (Doubao/Jimeng/Samsung)."""
+    return KnownMark(
+        key, label, location, True, "reverse-alpha", _text_mark_detect(key, label, location), _text_mark_remove(key)
+    )
 
 
 _REGISTRY: tuple[KnownMark, ...] = (
     KnownMark("gemini", "Google Gemini sparkle", "bottom-right", True, "reverse-alpha", _gemini_detect, _gemini_remove),
-    KnownMark(
-        "doubao", "Doubao 豆包AI生成 text", "bottom-right", True, "reverse-alpha", _doubao_detect, _doubao_remove
-    ),
-    KnownMark(
-        "jimeng", "Jimeng 即梦AI wordmark", "bottom-right", True, "reverse-alpha", _jimeng_detect, _jimeng_remove
-    ),
-    KnownMark(
-        "samsung", "Samsung Galaxy AI text", "bottom-left", True, "reverse-alpha", _samsung_detect, _samsung_remove
-    ),
+    _text_mark("doubao", "Doubao 豆包AI生成 text", "bottom-right"),
+    _text_mark("jimeng", "Jimeng 即梦AI wordmark", "bottom-right"),
+    _text_mark("samsung", "Samsung Galaxy AI text", "bottom-left"),
 )
 
 

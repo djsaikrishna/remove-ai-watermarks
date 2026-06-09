@@ -374,6 +374,21 @@ class TestAllCommand:
         result = runner.invoke(main, ["all", "/nonexistent/file.png"])
         assert result.exit_code != 0
 
+    def test_all_visible_step_uses_registry(self, runner, sample_png, tmp_path):
+        """Regression (#1): the `all` visible step must route through the registry
+        (best_auto_mark), so Doubao/Jimeng/Samsung text marks are handled -- not just
+        the Gemini sparkle via a hardcoded GeminiEngine."""
+        mock_cls, _mock_engine = _mock_invisible_engine()
+        output = tmp_path / "clean.png"
+        with (
+            patch("remove_ai_watermarks.cli.InvisibleEngine", mock_cls, create=True),
+            patch("remove_ai_watermarks.invisible_engine.InvisibleEngine", mock_cls),
+            patch("remove_ai_watermarks.watermark_registry.best_auto_mark", return_value=None) as mock_best,
+        ):
+            result = runner.invoke(main, ["all", str(sample_png), "-o", str(output)])
+        assert result.exit_code == 0, result.output
+        mock_best.assert_called()  # the registry auto-detector drove the visible pass
+
     def test_all_preserves_rgba_across_invisible_step(self, runner, tmp_path):
         """Regression: ``all`` must keep transparency even when the invisible
         step writes a 3-channel result (as the real diffusion engine does).
