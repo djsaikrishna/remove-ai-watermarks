@@ -154,6 +154,34 @@ The cleaner parses each layer, removes AI-related fields, and preserves standard
 
 ## Installation
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew install wiltodelta/tap/remove-ai-watermarks
+```
+
+This installs the core command surface (`identify`, `metadata`, `visible`,
+`erase`) as a self-contained CLI. The diffusion-based `invisible` / `all`
+pipeline needs heavy ML dependencies (torch, diffusers, multi-GB) and is kept
+out of the Homebrew build; add it with the `gpu` extra via pip if you need it:
+
+```bash
+pip install "remove-ai-watermarks[gpu]"
+```
+
+### conda
+
+A conda-forge recipe is under review
+([staged-recipes PR](https://github.com/conda-forge/staged-recipes/pull/33674)).
+Once it merges, the core package installs with:
+
+```bash
+conda install -c conda-forge remove-ai-watermarks
+```
+
+Like the Homebrew build, this is the core command surface; add the diffusion
+`invisible` / `all` pipeline with the pip `gpu` extra.
+
 ### Recommended
 
 Install as an isolated CLI tool — no need to manage virtual environments:
@@ -251,6 +279,23 @@ pytest
 # Run linters
 ./maintain.sh
 ```
+
+## ComfyUI
+
+Custom nodes are available so the watermark tools run inside a ComfyUI graph:
+[ComfyUI-remove-ai-watermarks](https://github.com/wiltodelta/ComfyUI-remove-ai-watermarks)
+([registry](https://registry.comfy.org/nodes/remove-ai-watermarks)).
+
+Install via ComfyUI Manager (search "Remove AI Watermarks") or manually:
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/wiltodelta/ComfyUI-remove-ai-watermarks
+pip install -r ComfyUI-remove-ai-watermarks/requirements.txt
+```
+
+Nodes: Remove Visible Watermark, Detect Visible Watermark, Erase Region (by
+mask), and Remove Invisible Watermark / SynthID (needs the `gpu` extra).
 
 ## Usage
 
