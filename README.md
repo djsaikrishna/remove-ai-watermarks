@@ -19,6 +19,12 @@ If this tool saves you time, consider [sponsoring its development](https://githu
 
 > **Intended for lawful use only.** Publishing and running this software is lawful; responsibility for any downstream use, and for compliance with local law, rests entirely with the user. Some jurisdictions restrict removing an AI label as such (see [Legal](#legal)). The authors do not condone use for deception, fraud, or any unlawful activity.
 
+## Scope
+
+This tool removes **AI-provenance watermarks** that a platform stamps onto content **you generated yourself** — SynthID, the Gemini / Nano Banana sparkle, the Doubao / Jimeng / Samsung visible AI labels, the Chinese TC260 "由…AI生成" label, and C2PA / IPTC / EXIF "Made with AI" metadata. The point is your autonomy over your own output.
+
+It does **not** target watermarks that protect someone else's paid or copyrighted content — stock-agency overlays (Shutterstock, Getty, iStock, Adobe Stock), classifieds-site marks, or any tiled "preview" watermark whose job is to gate a purchase. Removing those is out of scope by design. `erase` is a generic, user-driven region tool for your own objects, not an automatic stock-watermark remover.
+
 ## Features
 
 - **Visible watermark removal** — a registry of known marks in their usual places: the Gemini / Nano Banana sparkle, the Doubao "豆包AI生成" text strip, the Jimeng "★ 即梦AI" wordmark, and the Samsung Galaxy AI "✦ Contenuti generati dall'AI" strip (bottom-left, locale-specific). Each is removed by **reverse-alpha blending** against a captured alpha map (`original = (wm − α·logo)/(1−α)`), recovering the true pixels rather than inpainting a guess. The Gemini sparkle recovers cleanly on its own on bright backgrounds; it adapts the alpha to each image's sparkle opacity, so a more-opaque-than-captured sparkle is still fully removed (and on a dark background, where the fixed alpha would over-subtract and leave a dark spot, it automatically inpaints the small sparkle footprint instead); the Doubao, Jimeng, and Samsung text marks re-rasterize slightly per image, so a thin residual inpaint over the glyph footprint clears the leftover edges (the alpha maps are reproducibly rebuilt from controlled captures by `scripts/visible_alpha_solve.py`). Fast, offline, no GPU. `visible --mark auto` finds and removes the strongest detected mark. (For arbitrary logos/objects, see `erase`.)

@@ -349,8 +349,12 @@ def _no_visible_mark_exit(source: Path) -> NoReturn:
         )
     else:
         console.print(
-            "  No AI provenance signal found either. If there is a logo or object to remove,\n"
-            "  target it directly with the region eraser:\n"
+            "  No visible mark and no readable AI provenance signal. This does not prove\n"
+            "  the image is clean: an invisible pixel watermark such as SynthID cannot be\n"
+            "  detected here once the metadata proxy is absent (it may have been stripped\n"
+            "  earlier). If the image is AI-generated, regenerate the pixels with:\n"
+            f"    remove-ai-watermarks all {source.name}\n"
+            "  If instead there is a logo or object to remove, target it with the region eraser:\n"
             f"    remove-ai-watermarks erase {source.name} --region x,y,w,h"
         )
     raise SystemExit(EXIT_NO_VISIBLE_MARK)

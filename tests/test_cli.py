@@ -135,6 +135,11 @@ class TestVisibleCommand:
         assert result.exit_code == 2, result.output
         assert not output.exists()
         assert "erase" in result.output
+        # The "no signal" branch must NOT imply the image is clean: a missing
+        # metadata proxy is not proof an invisible pixel watermark (SynthID) is
+        # absent, so the message preserves that uncertainty and routes to 'all'.
+        assert "SynthID" in result.output
+        assert "all" in result.output
 
     def test_visible_auto_no_mark_routes_to_all_when_metadata(self, runner, tmp_path):
         # An image whose only signal is an invisible/metadata watermark (here SD
