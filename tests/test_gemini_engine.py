@@ -298,6 +298,28 @@ class TestOverSubtractionGuard:
         dalpha = self.engine.get_interpolated_alpha(dpos[2])
         assert self.engine._reverse_alpha_oversubtracts(dark, dalpha, (dpos[0], dpos[1])) is True
 
+    def test_midtone_background_does_not_leave_dark_diamond(self):
+        """2026-06-18 prod report: a faint sparkle on a MID-TONE background was
+        over-subtracted into a darker-than-background diamond ("the color just
+        changed, not removed"). No footprint pixel crosses zero there, so the
+        numerator gate misses it -- the dark-margin gate must catch it and inpaint.
+        """
+        image, (x, y, w, h) = self._composite_sparkle(bg_value=160)
+        footprint = image[y : y + h, x : x + w]
+        # The numerator (black-pit) gate alone does NOT fire on a mid-tone background.
+        alpha = self.engine.get_interpolated_alpha(w)
+        roi = footprint.astype(np.float32).mean(axis=2)
+        body = alpha[:h, :w] >= self.engine._FOOTPRINT_ALPHA
+        numerator = roi - np.clip(alpha[:h, :w], 0.0, 0.99) * self.engine.logo_value
+        assert float((numerator[body] < 0).sum()) / float(body.sum()) <= self.engine._OVERSUB_FOOTPRINT_FRAC
+        # ...but the over-subtraction guard still trips (via the dark-margin path) and
+        # removal leaves the footprint reading like the mid-tone background, not darker.
+        assert self.engine._reverse_alpha_oversubtracts(image, alpha, (x, y)) is True
+        out = self.engine.remove_watermark(image)
+        cleaned = out[y : y + h, x : x + w]
+        assert abs(float(cleaned.mean()) - 160.0) < 15.0, f"dark diamond: mean={cleaned.mean()}"
+        assert int(cleaned.min()) > 160 - 30, f"dark pit: min={cleaned.min()}"
+
 
 class TestUnderSubtractionGain:
     """Under-subtraction fix: a sparkle MORE opaque than the captured alpha must not

@@ -142,6 +142,19 @@ class GeminiEngine:
     # gate separates them with a wide margin.
     _OVERSUB_FOOTPRINT_FRAC = 0.05
 
+    # Mid-tone over-subtraction (2026-06-18 prod "the color just changed, not removed"
+    # report). The numerator fraction above only trips when reverse-alpha drives a
+    # footprint pixel fully NEGATIVE -- the dark-background black-pit case. On a MID-TONE
+    # background a sparkle fainter than the captured alpha is over-subtracted into a
+    # visibly DARKER-than-background diamond while no pixel ever crosses zero, so the
+    # numerator gate misses it and ships the dark mark. Predict the reverse-alpha output
+    # at the bright core, (core - a*logo)/(1-a); when it lands more than this many gray
+    # levels BELOW the local background ring, reverse-alpha would leave a dark diamond --
+    # inpaint instead. Calibrated wide: clean removals predict within ~12 of background
+    # (demo_banana ~-1, a bright-bg sparkle ~-12), the prod regression predicts ~-40 and
+    # the issue #30 dark case ~-82, so 25 separates keep-vs-inpaint with margin.
+    _OVERSUB_DARK_MARGIN = 25.0
+
     # Per-image alpha gain (under-subtraction fix). The captured alpha peaks ~0.51
     # (a ~51%-opaque sparkle). Some real Gemini sparkles are rendered MORE opaque,
     # so the fixed alpha under-subtracts and reverse-alpha leaves a bright residual
@@ -642,19 +655,24 @@ class GeminiEngine:
         a_cap = float(alpha_roi.max())
         if a_cap < 0.2:
             return None
-        gray = image.astype(np.float32).mean(axis=2)
         core = alpha_roi >= a_cap * self._ALPHA_GAIN_CORE_FRAC
         if not bool(core.any()):
             return None
-        core_obs = float(np.percentile(gray[y1:y2, x1:x2][core], 75))
-        # Local background = a ring just outside the footprint box.
+        # Convert only the footprint+ring crop to gray, not the whole image: every
+        # sample below lives inside the ring box, so a full-image mean is wasted work
+        # that scales with resolution (~70 ms on a 12 MP image, recomputed for both
+        # the alpha-gain estimate and the over-subtraction gate). The crop is sized by
+        # the footprint, so this is O(footprint^2) regardless of image size.
         ih, iw = image.shape[:2]
         pad = int((x2 - x1) * 0.7)
         ry1, ry2 = max(0, y1 - pad), min(ih, y2 + pad)
         rx1, rx2 = max(0, x1 - pad), min(iw, x2 + pad)
-        ring = gray[ry1:ry2, rx1:rx2]
+        ring = image[ry1:ry2, rx1:rx2].astype(np.float32).mean(axis=2)
+        # Footprint box expressed in ring-crop coordinates.
+        fy1, fy2, fx1, fx2 = y1 - ry1, y2 - ry1, x1 - rx1, x2 - rx1
+        core_obs = float(np.percentile(ring[fy1:fy2, fx1:fx2][core], 75))
         ring_mask = np.ones(ring.shape, dtype=bool)
-        ring_mask[y1 - ry1 : y2 - ry1, x1 - rx1 : x2 - rx1] = False
+        ring_mask[fy1:fy2, fx1:fx2] = False
         if int(ring_mask.sum()) < 10:
             return None
         return core_obs, float(np.median(ring[ring_mask])), a_cap
@@ -704,11 +722,19 @@ class GeminiEngine:
         alpha_map: NDArray[Any],
         position: tuple[int, int],
     ) -> bool:
-        """True when reverse-alpha would drive the footprint dark (issue #30).
+        """True when reverse-alpha would drive the footprint dark.
 
-        Tests the numerator ``watermarked - alpha*logo`` over the sparkle body: a
-        brightening overlay can never make it negative, so a large negative fraction
-        means the fixed alpha over-estimates this image's opacity.
+        Two signatures of the captured alpha over-estimating this image's sparkle
+        opacity, either of which means reverse-alpha would leave a dark mark:
+
+        1. Dark-background black pit (issue #30): the numerator
+           ``watermarked - alpha*logo`` over the sparkle body. A brightening overlay
+           can never make it negative, so a large negative fraction means the fixed
+           alpha over-subtracts past black.
+        2. Mid-tone dark diamond (see ``_OVERSUB_DARK_MARGIN``): on a mid-tone
+           background the over-subtraction darkens the core well below the background
+           without any pixel crossing zero, so case 1 misses it. Predict the
+           reverse-alpha core output and trip when it lands far below the local ring.
         """
         placed = self._footprint_indices(alpha_map, position, image.shape)
         if placed is None:
@@ -720,7 +746,18 @@ class GeminiEngine:
         roi = image[y1:y2, x1:x2].astype(np.float32)
         numerator = roi.mean(axis=2) - np.clip(alpha_roi, 0.0, 0.99) * self.logo_value
         frac = float((numerator[body] < 0).sum()) / float(body.sum())
-        return frac > self._OVERSUB_FOOTPRINT_FRAC
+        if frac > self._OVERSUB_FOOTPRINT_FRAC:
+            return True
+
+        # Mid-tone darkening: predict the reverse-alpha output at the bright core and
+        # compare to the local background ring (reuses the FP-gate / alpha-gain machinery).
+        cb = self._core_and_bg(image, alpha_map, position)
+        if cb is None:
+            return False
+        core_obs, bg, a_cap = cb
+        a = min(a_cap, 0.99)
+        predicted_core = (core_obs - a * self.logo_value) / (1.0 - a)
+        return predicted_core < bg - self._OVERSUB_DARK_MARGIN
 
     def _inpaint_footprint(
         self,
