@@ -485,6 +485,9 @@ class WatermarkRemover:
         guidance_scale: float | None = None,
         seed: int | None = None,
         vendor: str | None = None,
+        tile: bool = False,
+        tile_size: int = 1024,
+        tile_overlap: int = 128,
     ) -> Path:
         """Remove watermark from an image using regeneration attack.
 
@@ -501,6 +504,13 @@ class WatermarkRemover:
                 input with ``watermark_profiles.vendor_for_strength`` before processing
                 strips the metadata; the caller passes it down so display and execution
                 agree.
+            tile: Process the image in overlapping tiles instead of one forward pass.
+                The lossless alternative to a ``--max-resolution`` downscale for large
+                inputs that OOM on MPS/GPU (issue #10). Only engages when the long side
+                exceeds ``tile_size``; smaller images run a single pass unchanged.
+            tile_size: Tile dimension in px (default 1024, SDXL's training size).
+            tile_overlap: Overlap between adjacent tiles in px (default 128), feather-
+                blended so there is no visible seam.
 
         Returns:
             Path to the cleaned image.
@@ -541,10 +551,19 @@ class WatermarkRemover:
 
         _total_start = time.monotonic()
 
-        def _generate() -> Image.Image:
+        def _generate_one(img: Image.Image) -> Image.Image:
             if self.model_profile == "controlnet":
-                return self._run_controlnet(init_image, strength, num_inference_steps, guidance_scale, generator)
-            return self._run_img2img(init_image, strength, num_inference_steps, guidance_scale, generator)
+                return self._run_controlnet(img, strength, num_inference_steps, guidance_scale, generator)
+            return self._run_img2img(img, strength, num_inference_steps, guidance_scale, generator)
+
+        def _generate() -> Image.Image:
+            # Tile only when asked AND the image is larger than one tile; otherwise a
+            # single full-image pass (tiling a sub-tile image is pure overhead).
+            if tile and max(init_image.size) > tile_size:
+                from remove_ai_watermarks.noai.tiling import run_tiled
+
+                return run_tiled(_generate_one, init_image, tile_size, tile_overlap, self._set_progress)
+            return _generate_one(init_image)
 
         cleaned_image = _generate()
 

@@ -189,6 +189,33 @@ _adaptive_polish_option = click.option(
     "no-op there. Pass --no-adaptive-polish to disable. Independent of --unsharp/--humanize.",
 )
 
+
+# Tiled-diffusion knobs, shared by the diffusion commands (invisible/all/batch).
+# Tiling is the lossless alternative to --max-resolution for large inputs that OOM
+# on MPS/GPU: process at native resolution in overlapping, feather-blended tiles.
+def _tile_options(f: Any) -> Any:
+    """Apply the --tile / --tile-size / --tile-overlap options to a command."""
+    f = click.option(
+        "--tile-overlap",
+        type=int,
+        default=128,
+        help="Overlap between adjacent tiles in px (feather-blended, no seam). Default 128.",
+    )(f)
+    f = click.option(
+        "--tile-size",
+        type=int,
+        default=1024,
+        help="Tile dimension in px for --tile (SDXL's training size). Default 1024.",
+    )(f)
+    return click.option(
+        "--tile/--no-tile",
+        default=False,
+        help="Process large images in overlapping tiles instead of one forward pass -- the lossless "
+        "alternative to --max-resolution for inputs that OOM on MPS/GPU. Engages only when the long "
+        "side exceeds --tile-size; pair with --max-resolution 0 (default) to keep native resolution. Default off.",
+    )(f)
+
+
 # HuggingFace model + CFG knobs, shared by the diffusion commands (invisible/all/batch)
 # so the surface stays identical across them.
 _model_option = click.option(
@@ -668,6 +695,7 @@ def cmd_erase(
 @_guidance_scale_option
 @_auto_option
 @_adaptive_polish_option
+@_tile_options
 @click.pass_context
 def cmd_invisible(
     ctx: click.Context,
@@ -689,6 +717,9 @@ def cmd_invisible(
     guidance_scale: float | None,
     auto: bool,
     adaptive_polish: bool,
+    tile: bool,
+    tile_size: int,
+    tile_overlap: int,
 ) -> None:
     """Remove invisible AI watermarks (SynthID, StableSignature, TreeRing).
 
@@ -747,6 +778,9 @@ def cmd_invisible(
         min_resolution=min_resolution,
         upscaler=upscaler,
         vendor=vendor,
+        tile=tile,
+        tile_size=tile_size,
+        tile_overlap=tile_overlap,
     )
     elapsed = time.monotonic() - t0
 
@@ -917,6 +951,7 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
 @_guidance_scale_option
 @_auto_option
 @_adaptive_polish_option
+@_tile_options
 @click.pass_context
 def cmd_all(
     ctx: click.Context,
@@ -940,6 +975,9 @@ def cmd_all(
     guidance_scale: float | None,
     auto: bool,
     adaptive_polish: bool,
+    tile: bool,
+    tile_size: int,
+    tile_overlap: int,
 ) -> None:
     """Remove ALL watermarks: visible + invisible + metadata.
 
@@ -1044,6 +1082,9 @@ def cmd_all(
                 min_resolution=min_resolution,
                 upscaler=upscaler,
                 vendor=vendor,
+                tile=tile,
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
             )
             console.print("    Invisible watermark removed")
 
@@ -1121,6 +1162,9 @@ def _process_batch_image(
     model: str | None = None,
     guidance_scale: float | None = None,
     adaptive_polish: bool = False,
+    tile: bool = False,
+    tile_size: int = 1024,
+    tile_overlap: int = 128,
 ) -> None:
     """Process a single image for batch mode.
 
@@ -1179,6 +1223,9 @@ def _process_batch_image(
                 max_resolution=max_resolution,
                 min_resolution=min_resolution,
                 upscaler=upscaler,
+                tile=tile,
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
                 # Detect the vendor from the pristine original (`img_path`), not the
                 # visible-processed `out_path` whose C2PA is already gone.
                 vendor=vendor_for_strength(img_path),
@@ -1238,6 +1285,7 @@ def _process_batch_image(
 @_guidance_scale_option
 @_auto_option
 @_adaptive_polish_option
+@_tile_options
 @click.pass_context
 def cmd_batch(
     ctx: click.Context,
@@ -1261,6 +1309,9 @@ def cmd_batch(
     guidance_scale: float | None,
     auto: bool,
     adaptive_polish: bool,
+    tile: bool,
+    tile_size: int,
+    tile_overlap: int,
 ) -> None:
     """Process all images in a directory."""
     _banner()
@@ -1321,6 +1372,9 @@ def cmd_batch(
                     model=model,
                     guidance_scale=guidance_scale,
                     adaptive_polish=adaptive_polish,
+                    tile=tile,
+                    tile_size=tile_size,
+                    tile_overlap=tile_overlap,
                 )
                 processed += 1
 
