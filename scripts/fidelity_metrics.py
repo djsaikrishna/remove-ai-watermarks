@@ -9,7 +9,8 @@
 #   "rapidfuzz",
 #   "torch",
 #   "lpips",
-#   "easyocr",
+#   "paddleocr",
+#   "paddlepaddle",
 #   "insightface",
 #   "onnxruntime",
 # ]
@@ -22,29 +23,38 @@ preserved -- so "closer to the original" is the right axis here (between two
 equally-scrubbed outputs, the one that deviates less from the original wins).
 
 It is a standalone eval tool, NOT part of the package: PEP 723 inline deps let
-``uv run`` build a throwaway env so the heavy models (EasyOCR, insightface,
+``uv run`` build a throwaway env so the heavy models (PaddleOCR, insightface,
 LPIPS) never touch uv.lock or the shipped library. Metrics self-gate: face
 metrics run only where faces are detected, text metrics only where text is.
 
-Four metric groups (all reference = original):
-  1. Text  -- EasyOCR character error rate (CER) of each variant vs the original's
-              OCR string. Lower = text better preserved. OCR is noisy, so treat it
-              as a RELATIVE comparison (every variant scored against the same ref).
-  2. Face identity -- insightface (buffalo_l) ArcFace cosine similarity, original
-              face vs the geometrically-matched variant face. Higher = identity kept.
-  3. Face texture  -- LPIPS + Laplacian-variance ratio (variant/original) on face
-              crops. Catches "plastication" (lost high-frequency skin detail):
-              lapvar ratio < 1 = smoother than the original.
-  4. Whole image   -- LPIPS / SSIM / PSNR vs the original (context: background too).
+Two subcommands:
+
+  ocr      -- OCR images (PaddleOCR PP-OCRv6) into a JSON {basename: text} file.
+              Run this on the ORIGINALS, hand-verify/correct the file, and it
+              becomes the ground truth for ``compare --ground-truth`` -- the clean
+              way to score text, since OCR-vs-OCR is doubly noisy (errors on both
+              images + reading-order differences inflate CER even on identical text).
+
+  compare  -- Score each VARIANT against the ORIGINAL across four groups:
+              1. Text  -- character error rate (CER) of the variant's OCR vs the
+                 verified ground truth (or the original's OCR if no --ground-truth).
+              2. Face identity -- insightface (buffalo_l) ArcFace cosine similarity.
+              3. Face texture  -- LPIPS + Laplacian-variance ratio on face crops
+                 (catches "plastication": ratio < 1 = smoother than the original).
+              4. Whole image   -- LPIPS / SSIM / PSNR vs the original.
 
 Usage:
-    uv run scripts/fidelity_metrics.py --original O.png \
-        --variant controlnet=C.png --variant qwen=Q.png --ocr-langs en,ru,ch_sim
+    uv run scripts/fidelity_metrics.py ocr O1.png O2.png --langs en,ru,ch --out gt.json
+    # (edit gt.json by hand to fix any OCR slips, then:)
+    uv run scripts/fidelity_metrics.py compare --original O1.png \
+        --variant controlnet=C.png --variant qwen=Q.png \
+        --ocr-langs en,ru,ch --ground-truth gt.json
 """
 
 from __future__ import annotations
 
-import logging
+import json
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -54,8 +64,6 @@ import cv2
 import numpy as np
 from _plain_console import Console, Table
 
-logging.basicConfig(level=logging.WARNING, format="%(message)s")
-log = logging.getLogger(__name__)
 console = Console()
 
 
@@ -76,45 +84,90 @@ def _match_size(variant: np.ndarray, ref: np.ndarray) -> np.ndarray:
     return variant
 
 
-# ── text: OCR CER ────────────────────────────────────────────────────
-
-# EasyOCR rejects some language combos in one Reader, so group into compatible
-# readers and union the detections. Cyrillic and Chinese cannot share a reader.
-_OCR_GROUPS = {
-    "en": ["en"],
-    "ru": ["ru", "en"],
-    "ch_sim": ["ch_sim", "en"],
-}
+def _norm(text: str) -> str:
+    """Normalize for CER: NFC + drop ALL whitespace (segmentation-order agnostic)."""
+    return "".join(unicodedata.normalize("NFC", text).split())
 
 
-def _ocr_string(readers: list, bgr: np.ndarray) -> str:
-    """Union all readers' detections into one position-sorted, whitespace-free string."""
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    dets: list[tuple[float, float, str]] = []
-    for reader in readers:
-        for box, text, conf in reader.readtext(rgb):
-            if conf < 0.3 or not text.strip():
-                continue
-            ys = [p[1] for p in box]
-            xs = [p[0] for p in box]
-            dets.append((min(ys), min(xs), text.strip()))
-    # Sort top-to-bottom, then left-to-right (coarse reading order).
-    dets.sort(key=lambda d: (round(d[0] / 20.0), d[1]))
-    return "".join(t for _, _, t in dets).replace(" ", "")
+# ── text: PaddleOCR (PP-OCRv6) ───────────────────────────────────────
+
+# Our lang codes -> PaddleOCR lang. The 'ch' model also reads Latin; 'ru' reads
+# Cyrillic + Latin. Multiple langs in one image -> run each model, union detections.
+_PADDLE_LANG = {"en": "en", "ru": "ru", "ch": "ch", "ch_sim": "ch", "latin": "latin"}
+_paddle_cache: dict[str, Any] = {}
 
 
-def _build_ocr_readers(langs: list[str]) -> list:
-    import easyocr
+def _paddle(lang: str) -> Any:
+    if lang not in _paddle_cache:
+        from paddleocr import PaddleOCR
 
-    seen: set[tuple[str, ...]] = set()
-    readers = []
+        _paddle_cache[lang] = PaddleOCR(
+            lang=lang,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+        )
+    return _paddle_cache[lang]
+
+
+def _box_xyxy(box: Any) -> tuple[float, float, float, float]:
+    """Axis-aligned (x1, y1, x2, y2) of a PaddleOCR rec box ([x1,y1,x2,y2]) or poly (4x2)."""
+    arr = np.asarray(box, dtype=np.float32).reshape(-1)
+    if arr.size == 4:
+        return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
+    pts = arr.reshape(-1, 2)
+    return float(pts[:, 0].min()), float(pts[:, 1].min()), float(pts[:, 0].max()), float(pts[:, 1].max())
+
+
+def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (area_a + area_b - inter + 1e-9)
+
+
+def _ocr_lines(bgr: np.ndarray, langs: list[str], min_score: float = 0.5) -> list[str]:
+    """Detected text lines in reading order, unioned across lang models with spatial NMS.
+
+    Several language models over one image re-detect the same lines -- and crucially the
+    WRONG-script models read e.g. Cyrillic as confident Latin gibberish. So instead of a
+    naive union, keep the HIGHEST-score detection per physical location (greedy IoU NMS):
+    the model that actually fits a line wins it (the 'ru' model takes the Cyrillic, 'ch'
+    the CJK, 'en' the Latin), and the cross-script garbage is dropped.
+    """
+    raw: list[tuple[float, tuple[float, float, float, float], str]] = []
     for lang in langs:
-        group = tuple(_OCR_GROUPS.get(lang, [lang]))
-        if group in seen:
+        plang = _PADDLE_LANG.get(lang, lang)
+        for page in _paddle(plang).predict(bgr):
+            texts = page.get("rec_texts", [])
+            scores = page.get("rec_scores", [])
+            boxes = page.get("rec_boxes", None)
+            if boxes is None or len(boxes) == 0:
+                boxes = page.get("rec_polys", [])
+            for text, score, box in zip(texts, scores, boxes, strict=False):
+                if score < min_score or not text.strip():
+                    continue
+                raw.append((float(score), _box_xyxy(box), text.strip()))
+
+    raw.sort(key=lambda d: d[0], reverse=True)
+    kept: list[tuple[tuple[float, float, float, float], str]] = []
+    for _score, box, text in raw:
+        if any(_iou(box, kbox) > 0.3 for kbox, _ in kept):
             continue
-        seen.add(group)
-        readers.append(easyocr.Reader(list(group), gpu=False, verbose=False))
-    return readers
+        kept.append((box, text))
+    kept.sort(key=lambda d: (round(d[0][1] / 20.0), d[0][0]))  # reading order: y then x
+    return [t for _, t in kept]
+
+
+def _cer(ref: str, hyp: str) -> float:
+    from rapidfuzz.distance import Levenshtein
+
+    return Levenshtein.normalized_distance(_norm(ref), _norm(hyp))
 
 
 # ── face: detection + ArcFace + texture ──────────────────────────────
@@ -183,12 +236,10 @@ def _ssim_psnr(a_bgr: np.ndarray, b_bgr: np.ndarray) -> tuple[float, float]:
 
     a = cv2.cvtColor(a_bgr, cv2.COLOR_BGR2GRAY)
     b = cv2.cvtColor(b_bgr, cv2.COLOR_BGR2GRAY)
-    ssim = float(structural_similarity(a, b))
-    psnr = float(peak_signal_noise_ratio(a, b))
-    return ssim, psnr
+    return float(structural_similarity(a, b)), float(peak_signal_noise_ratio(a, b))
 
 
-# ── main ─────────────────────────────────────────────────────────────
+# ── reporting ────────────────────────────────────────────────────────
 
 
 def _mean(xs: list[float]) -> float | None:
@@ -199,18 +250,42 @@ def _fmt(v: float | None, nd: int = 3) -> str:
     return "-" if v is None else f"{v:.{nd}f}"
 
 
-@click.command()
+# ── CLI ──────────────────────────────────────────────────────────────
+
+
+@click.group()
+def cli() -> None:
+    """Objective fidelity metrics for watermark-removal outputs."""
+
+
+@cli.command("ocr")
+@click.argument("images", nargs=-1, required=True, type=click.Path(exists=True))
+@click.option("--langs", default="en", help="Comma list of OCR langs (en,ru,ch).")
+@click.option("--out", type=click.Path(), default=None, help="Write {basename: text} JSON here (for ground truth).")
+def ocr_cmd(images: tuple[str, ...], langs: str, out: str | None) -> None:
+    """OCR images into a ground-truth seed -- hand-verify the result before using it."""
+    lang_list = [x.strip() for x in langs.split(",") if x.strip()]
+    result: dict[str, str] = {}
+    for path in images:
+        lines = _ocr_lines(_load_bgr(path), lang_list)
+        text = "\n".join(lines)
+        result[Path(path).name] = text
+        console.print(f"\n=== {Path(path).name} ===")
+        console.print(text or "(no text detected)")
+    if out:
+        Path(out).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        console.print(f"\n  Wrote {out} -- verify/correct it by hand, then pass it to `compare --ground-truth`.")
+
+
+@cli.command("compare")
 @click.option("--original", required=True, type=click.Path(exists=True), help="Reference (unprocessed) image.")
 @click.option(
-    "--variant",
-    "variants",
-    multiple=True,
-    required=True,
-    help="LABEL=PATH of a cleaned output (repeatable).",
+    "--variant", "variants", multiple=True, required=True, help="LABEL=PATH of a cleaned output (repeatable)."
 )
-@click.option("--ocr-langs", default="en", help="Comma list of EasyOCR langs (en,ru,ch_sim). Empty = skip text.")
+@click.option("--ocr-langs", default="en", help="Comma list of OCR langs (en,ru,ch). Empty = skip text.")
+@click.option("--ground-truth", type=click.Path(exists=True), default=None, help="Verified {basename: text} JSON.")
 @click.option("--no-faces", is_flag=True, help="Skip face metrics.")
-def main(original: str, variants: tuple[str, ...], ocr_langs: str, no_faces: bool) -> None:
+def compare(original: str, variants: tuple[str, ...], ocr_langs: str, ground_truth: str | None, no_faces: bool) -> None:
     """Score each VARIANT against ORIGINAL across the four fidelity groups."""
     ref = _load_bgr(original)
     parsed: list[tuple[str, np.ndarray]] = []
@@ -226,17 +301,19 @@ def main(original: str, variants: tuple[str, ...], ocr_langs: str, no_faces: boo
     # ── text ──
     ocr_cer: dict[str, float | None] = {label: None for label, _ in parsed}
     if langs:
-        console.print(f"  OCR ({','.join(langs)})...")
-        from rapidfuzz.distance import Levenshtein
-
-        readers = _build_ocr_readers(langs)
-        ref_text = _ocr_string(readers, ref)
-        if ref_text:
-            for label, img in parsed:
-                hyp = _ocr_string(readers, img)
-                ocr_cer[label] = Levenshtein.normalized_distance(ref_text, hyp)
+        ref_text: str | None = None
+        if ground_truth:
+            gt = json.loads(Path(ground_truth).read_text(encoding="utf-8"))
+            ref_text = gt.get(Path(original).name)
+            if ref_text is None:
+                console.print(f"  (no ground-truth entry for {Path(original).name}; skipping text)")
         else:
-            console.print("  (no text detected in the original; skipping text metric)")
+            console.print(f"  OCR original ({','.join(langs)})...")
+            ref_text = "\n".join(_ocr_lines(ref, langs))
+        if ref_text:
+            console.print(f"  OCR variants ({','.join(langs)})...")
+            for label, img in parsed:
+                ocr_cer[label] = _cer(ref_text, "\n".join(_ocr_lines(img, langs)))
 
     # ── faces ──
     face_stats: dict[str, FaceStats] = {label: FaceStats() for label, _ in parsed}
@@ -300,4 +377,4 @@ def main(original: str, variants: tuple[str, ...], ocr_langs: str, no_faces: boo
 
 
 if __name__ == "__main__":
-    main()
+    cli()

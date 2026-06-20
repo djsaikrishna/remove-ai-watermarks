@@ -181,6 +181,15 @@ pos original plus its minimum-clearing cleaned output (manifest `verified_via` =
 was oracle-verified but is not committed (third-party content stays out of the
 public corpus).
 
+**Oracle validation order: start with OpenAI.** When validating removal across
+vendors, run the OpenAI arm first. `openai.com/verify` is more accessible than the
+Gemini app -- fewer per-check restrictions, so it gives the fastest signal and is
+the strongest candidate for automation (Playwright / Chrome MCP driving
+`openai.com/verify`); the Gemini "Verify with SynthID" flow is more manual. This is
+an ordering/throughput choice, not a substitution: each oracle only reads its own
+vendor's SynthID (`openai.com/verify` is OpenAI-scoped), so Google content still
+needs the Gemini app.
+
 | Vendor | Images | Resolution(s) | Pipeline | Removed at |
 |--------|--------|---------------|----------|------------|
 | OpenAI (gpt-image) | n=4 (3 archived + 1 external-only) | 1024x1536 .. 1600x1600 | native | **0.05** |
