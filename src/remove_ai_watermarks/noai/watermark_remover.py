@@ -5,8 +5,10 @@ Three pipelines (selected by the explicit ``pipeline`` ctor arg):
 0. ``qwen`` -- Qwen-Image (20B MMDiT, Apache-2.0) img2img. The scrub still comes from
    the img2img ``strength``; Qwen preserves text (incl. CJK) and structure markedly
    better than SDXL at the scrub floor, so it over-regenerates real photos far less.
-   CUDA/cloud-class (does not fit MPS). See ``watermark_profiles`` for the prototype
-   oracle floors (pending seed-repeat cert).
+   CUDA/cloud-class (does not fit MPS). See ``watermark_profiles`` for the certified
+   oracle floors. (Near-threshold scrub is seed-non-deterministic, but the prod path
+   pins ONE fixed seed, so a certified floor reproduces run-to-run -- pinning the seed
+   is the release gate, not sweeping seeds.)
 
 Two SDXL pipelines:
 1. ``controlnet`` (DEFAULT) -- SDXL img2img with a canny ControlNet. The watermark
