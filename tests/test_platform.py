@@ -126,6 +126,58 @@ class TestModelProfiles:
         assert normalize_profile("CONTROLNET") == "controlnet"
 
 
+class TestFp16WeightVariant:
+    """_load_from_pretrained reads the fp16 weight variant on fp16, with a fallback.
+
+    Loading the fp16 ``variant`` reads the half-precision weight files (~half the bytes)
+    instead of the fp32 defaults + a downcast, which roughly halves the cold-start weight
+    read. fp32 (cpu/mps) and bf16 (qwen) must never request the variant; a checkpoint
+    without fp16 files must fall back to the default weights (prior behavior).
+    """
+
+    def _remover(self, dtype: object):
+        if not is_watermark_removal_available():
+            pytest.skip("torch/diffusers not installed")
+        from remove_ai_watermarks.noai.watermark_remover import WatermarkRemover
+
+        # device="cpu" alone would force fp32; the explicit torch_dtype override lets us
+        # exercise the fp16 path with no GPU (construction loads no weights).
+        return WatermarkRemover(device="cpu", torch_dtype=dtype)
+
+    def test_fp16_requests_variant(self):
+        import torch
+
+        remover = self._remover(torch.float16)
+        cls = MagicMock()
+        cls.from_pretrained.return_value = "PIPE"
+        out = remover._load_from_pretrained(cls, "some/model", token="t")
+        assert out == "PIPE"
+        cls.from_pretrained.assert_called_once_with("some/model", variant="fp16", token="t")
+
+    def test_fp16_falls_back_when_variant_missing(self):
+        import torch
+
+        remover = self._remover(torch.float16)
+        cls = MagicMock()
+        cls.from_pretrained.side_effect = [OSError("no fp16 weight files"), "PIPE"]
+        out = remover._load_from_pretrained(cls, "some/model", token="t")
+        assert out == "PIPE"
+        assert cls.from_pretrained.call_count == 2
+        first, second = cls.from_pretrained.call_args_list
+        assert first.kwargs.get("variant") == "fp16"
+        assert "variant" not in second.kwargs  # the fallback drops the variant
+
+    def test_fp32_never_requests_variant(self):
+        import torch
+
+        remover = self._remover(torch.float32)
+        cls = MagicMock()
+        cls.from_pretrained.return_value = "PIPE"
+        remover._load_from_pretrained(cls, "some/model")
+        cls.from_pretrained.assert_called_once_with("some/model")
+        assert "variant" not in cls.from_pretrained.call_args.kwargs
+
+
 class _StubImage:
     """Minimal PIL.Image stand-in: just the ``width``/``height`` the pure helper reads."""
 

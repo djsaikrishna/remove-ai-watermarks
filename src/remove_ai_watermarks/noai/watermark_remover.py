@@ -490,6 +490,27 @@ class WatermarkRemover:
             load_kwargs["token"] = self.hf_token
         return load_kwargs
 
+    def _load_from_pretrained(self, cls: Any, model_id: str, **load_kwargs: Any) -> Any:
+        """Call ``cls.from_pretrained`` reading the fp16 weight VARIANT when on fp16.
+
+        When ``torch_dtype`` is float16 (the CUDA/XPU SDXL default), pass
+        ``variant="fp16"`` so diffusers fetches/reads the half-precision weight files
+        (~half the bytes of the fp32 defaults) instead of reading the full fp32 files
+        and downcasting in memory. On a warm weights cache this roughly halves the
+        cold-start weight read + host->device transfer, which a phase-timed Modal run
+        measured as ~half of the ~25s cold start. Not every checkpoint publishes an
+        fp16 variant (a custom ``--model``, or the canny ControlNet if it ships only
+        default files), so fall back to the default weights if the variant is missing -
+        worst case is the prior behavior (read fp32, downcast). fp32 (cpu/mps) and bf16
+        (qwen) never request the variant.
+        """
+        if self.torch_dtype == torch.float16:
+            try:
+                return cls.from_pretrained(model_id, variant="fp16", **load_kwargs)
+            except Exception as exc:
+                logger.info("No fp16 weight variant for %s (%s); loading default weights", model_id, exc)
+        return cls.from_pretrained(model_id, **load_kwargs)
+
     def _load_pipeline(self) -> AutoImg2ImgPipeline:
         """Load the plain SDXL img2img pipeline lazily."""
         if self._pipeline is None:
@@ -501,7 +522,7 @@ class WatermarkRemover:
             load_kwargs["requires_safety_checker"] = False
             self._maybe_add_fp16_vae(load_kwargs)
 
-            pipeline = AutoImg2ImgPipeline.from_pretrained(self.model_id, **load_kwargs)  # type: ignore
+            pipeline = self._load_from_pretrained(AutoImg2ImgPipeline, self.model_id, **load_kwargs)  # type: ignore
             self._pipeline = self._move_to_device_and_optimize(pipeline)
 
             logger.info("Model loaded successfully")
@@ -522,14 +543,18 @@ class WatermarkRemover:
 
             logger.info("Loading SDXL + ControlNet (%s) on %s...", CONTROLNET_CANNY_MODEL, self.device)
             self._set_progress(f"Loading ControlNet: {CONTROLNET_CANNY_MODEL}")
-            controlnet = ControlNetModel.from_pretrained(CONTROLNET_CANNY_MODEL, torch_dtype=self.torch_dtype)
+            controlnet = self._load_from_pretrained(
+                ControlNetModel, CONTROLNET_CANNY_MODEL, torch_dtype=self.torch_dtype
+            )
 
             load_kwargs = self._base_load_kwargs()
             load_kwargs["controlnet"] = controlnet
             self._maybe_add_fp16_vae(load_kwargs)
 
             self._set_progress(f"Loading model weights: {self.model_id}")
-            pipeline = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(self.model_id, **load_kwargs)
+            pipeline = self._load_from_pretrained(
+                StableDiffusionXLControlNetImg2ImgPipeline, self.model_id, **load_kwargs
+            )
             pipeline = self._move_to_device_and_optimize(pipeline)
             with contextlib.suppress(Exception):
                 pipeline.set_progress_bar_config(disable=True)
