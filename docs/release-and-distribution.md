@@ -23,3 +23,12 @@ stays in `CLAUDE.md`; read this before cutting a release.
 **A failed PyPI upload of one artifact still leaves the other live and you cannot re-upload the same version** — fix the build and cut the next patch.
 
 **Build backend is unpinned `hatchling`** (`[build-system] requires`) since 2026-06-09. History: it was pinned `<1.31` because hatchling 1.30.0 made Metadata-Version 2.5 (PEP 794) the default and the twine bundled in `pypa/gh-action-pypi-publish@release/v1` rejected it (`"'2.5' is not a valid Metadata-Version"`), which **failed the v0.8.3 PyPI upload on 2026-06-01**; hatchling 1.30.1 reverted the default to 2.4. After the workflow moved to `uv publish` (whose uploader accepts 2.5) the pin was belt-and-suspenders only, and once v0.9.0 + v0.10.0 both published wheel+sdist through that path (verified on PyPI) it was dropped. If a future hatchling flips the default to 2.5 again and some consumer chokes, re-pin with a dated comment.
+
+## Dependency CVE-resolution history (`uv-secure`)
+
+The standing `uv-secure` gate in `maintain.sh` is clean; this is the changelog of how each alert was resolved, so a future alert is not re-triaged from scratch.
+
+- **idna** bumped 3.11 -> 3.16, fixing GHSA-65pc-fj4g-8rjx.
+- **aiohttp** bumped 3.13.5 -> 3.14.0 via `uv lock --upgrade-package aiohttp`, fixing GHSA-hg6j-4rv6-33pg + GHSA-jg22-mg44-37j8.
+- **basicsr** Dependabot alert GHSA-86w8-vhw6-q9qq is resolved by removal: the experimental `restore` extra was retired and basicsr is no longer anywhere in the dependency tree.
+- **torch** Dependabot alert **GHSA-rrmf-rvhw-rf47** (`torch.jit.script` memory corruption, vulnerable `<= 2.12.0`) is **dismissed as `not_used`** (2026-06-10): torch is a transitive dep of the optional `gpu` extra only, the codebase never calls `torch.jit` (grep-verified), and **no patched torch version exists** (`first_patched_version` is null), so it cannot be closed by an upgrade — do not re-triage it.
