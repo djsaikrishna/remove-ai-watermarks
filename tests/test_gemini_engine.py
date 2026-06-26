@@ -514,6 +514,38 @@ class TestSparkleFalsePositiveGate:
         assert det.confidence < 0.5
         assert not det.detected
 
+    def test_bright_background_low_gradient_match_demoted(self):
+        """Bright-background content FP (2026-06-26 landing-page reports: a snow+sky
+        photo and a white product render scored ~0.51). A bright background gives the
+        match a HIGH core-ring margin, so the margin gate cannot demote it -- but the
+        smooth blob lacks the crisp star edges of a real sparkle, so its GRADIENT NCC
+        is low. The gradient gate (``_SPARKLE_FP_GRAD``) demotes it. Reproduces the
+        regime with a heavily-blurred bright sparkle: high margin, low gradient, and a
+        pre-gate fusion above the 0.5 promote bar (so it WOULD have been detected).
+        """
+        size = 1400
+        config = get_watermark_config(size, size)
+        x, y = config.get_position(size, size)
+        alpha = self.engine.get_alpha_map(WatermarkSize.LARGE)
+        ah, aw = alpha.shape[:2]
+        img = np.full((size, size, 3), 110, dtype=np.float32)
+        a = np.clip(alpha * 1.6, 0.0, 1.0)[:, :, None]
+        img[y : y + ah, x : x + aw] = a * 255.0 + (1.0 - a) * img[y : y + ah, x : x + aw]
+        img = cv2.GaussianBlur(np.clip(img, 0, 255).astype(np.uint8), (39, 39), 0)
+        det = self.engine.detect_watermark(img)
+        # Pre-gate fusion clears the 0.5 promote bar (would have been detected)...
+        pre = det.spatial_score * 0.5 + det.gradient_score * 0.3 + det.variance_score * 0.2
+        assert pre > 0.5
+        # ...the OLD margin gate cannot catch it (bright background -> high margin)...
+        margin = self.engine._core_ring_margin(img, self.engine.get_interpolated_alpha(det.region[2]), det.region[:2])
+        assert margin is not None
+        assert margin >= self.engine._SPARKLE_FP_MARGIN
+        # ...but the gradient is low (smooth blob, not a crisp star)...
+        assert det.gradient_score < self.engine._SPARKLE_FP_GRAD
+        # ...so the gradient gate demotes it below the detection bar.
+        assert det.confidence < 0.5
+        assert not det.detected
+
 
 class TestCornerPromotion:
     """Issue #36: a small sparkle in the corner must not be lost to a larger decoy.

@@ -86,6 +86,16 @@ class TestDetect:
         solid = np.full_like(box, 255)
         assert _template_match_score(solid, _ALPHA_NATIVE_WIDTH) < DETECT_NCC_THRESHOLD
 
+    def test_small_image_guarded_from_false_positive(self):
+        """Below the minimum short side a tiny geometric shape spuriously NCC-matches
+        the CJK silhouette (2026-06-26 FP: a 48x48 app-icon chevron scored 0.47). The
+        size guard suppresses detection there. Bracket it: a real mark is detected at
+        native size, but the same content downscaled below the guard is not."""
+        wm, _mark = _compose(_ALPHA_NATIVE_WIDTH, _ALPHA_NATIVE_WIDTH)
+        eng = JimengEngine()
+        assert eng.detect(wm).detected  # native: real mark detected
+        assert not eng.detect(cv2.resize(wm, (150, 150))).detected  # below guard: suppressed
+
     def test_synthetic_mark_detected(self):
         """A watermark composed from the real alpha is detected at its threshold."""
         eng = JimengEngine()

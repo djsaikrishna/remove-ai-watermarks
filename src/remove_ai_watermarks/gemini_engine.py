@@ -185,6 +185,21 @@ class GeminiEngine:
     # fail to demote.
     _SPARKLE_FP_CONF = 0.65
     _SPARKLE_FP_MARGIN = 5.0
+    # Bright-background content false positives (2026-06-26 landing-page FPs: a snow+sky
+    # photo and a white-background product render both scored ~0.51). The margin gate
+    # above cannot catch them -- a bright background gives the "core" a HIGH core-ring
+    # margin (it is genuinely brighter than its surroundings), so the brightness check
+    # reads it as a real overlay. The discriminating signature is the GRADIENT NCC: a
+    # real white sparkle is a crisp star silhouette (grad ~0.97-1.0 on the synthetic
+    # composites, ~0.96 on the real #36 corner sparkle), while a smooth luminance blob
+    # that shape-NCC-matches the rough outline has low gradient fidelity (the two FPs
+    # measured 0.105 and 0.463). So ALSO demote a low-confidence match whose gradient
+    # NCC is below this floor, regardless of margin -- 0.55 sits well above the worst FP
+    # (0.463) and far below every real sparkle (>=0.8). This only ADDS demotions on
+    # bright backgrounds (a real bright-bg sparkle keeps grad ~0.97), so it cannot
+    # regress a dark/mid sparkle (already kept by margin) or a white-bg one (kept by
+    # confidence >= 0.65, above the gate).
+    _SPARKLE_FP_GRAD = 0.55
 
     # Self-verify fallback. The gain estimate corrects most under-subtractions, but
     # on the spaces corpus a tail of strong sparkles still survived reverse-alpha
@@ -399,16 +414,24 @@ class GeminiEngine:
         # best_fused is the selected candidate's spatial*0.5 + grad*0.3 + var*0.2.
         confidence = best_fused
 
-        # False-positive gate: a low-confidence shape match whose core is NOT brighter
-        # than its surroundings is a content false positive, not a white sparkle overlay.
+        # False-positive gate: a low-confidence match that shows NEITHER real-sparkle
+        # signature is a content false positive, not a white sparkle overlay. A real
+        # sparkle proves itself by a bright core (high core-ring margin, on dark/mid
+        # backgrounds) OR a crisp star silhouette (high gradient NCC, on any background
+        # incl. bright). Demote when both are weak -- this catches the dark/mid no-core
+        # FP (low margin) AND the bright-background smooth-blob FP (high margin but low
+        # gradient), which the margin check alone misses. See _SPARKLE_FP_GRAD.
         if confidence < self._SPARKLE_FP_CONF:
             margin = self._core_ring_margin(image, self.get_interpolated_alpha(best_scale), (pos_x, pos_y))
-            if margin is not None and margin < self._SPARKLE_FP_MARGIN:
+            low_margin = margin is not None and margin < self._SPARKLE_FP_MARGIN
+            low_grad = grad_score < self._SPARKLE_FP_GRAD
+            if low_margin or low_grad:
                 logger.debug(
-                    "Sparkle FP gate: conf=%.3f, core-ring margin=%.1f < %.1f; demoting.",
+                    "Sparkle FP gate: conf=%.3f, core-ring margin=%s, grad=%.3f < %.2f; demoting.",
                     confidence,
-                    margin,
-                    self._SPARKLE_FP_MARGIN,
+                    f"{margin:.1f}" if margin is not None else "n/a",
+                    grad_score,
+                    self._SPARKLE_FP_GRAD,
                 )
                 confidence = min(confidence, 0.30)
 

@@ -59,6 +59,19 @@ _OVERSUB_BODY_ALPHA_FLOOR = 0.15  # alpha above which a block pixel counts as gl
 _OVERSUB_INPAINT_DILATE = 9
 _OVERSUB_INPAINT_RADIUS = 4
 
+# Minimum image short side (px) for text-mark DETECTION. Below this the glyph
+# template degrades to the ``min_gw`` floor (~8 px) and TM_CCOEFF_NORMED on a few
+# pixels is noise, so an unrelated small geometric shape can spuriously correlate
+# with the CJK silhouette (2026-06-26 FP: a 48x48 app icon -- a blue chevron --
+# scored Doubao 0.41 / Jimeng 0.47, both above their thresholds). The FP is purely
+# a small-size artifact: the same icon upscaled collapses to ~0.06-0.10 NCC at 256
+# px and above. A real AI-generation text label is stamped on a full-resolution
+# render (the captured samples are 1086-2048 px wide), so 200 px sits far below any
+# genuine mark while killing the icon/thumbnail noise band (<=96 px). Detection is
+# skipped (verdict stays "unknown", the safe default) rather than risk a false
+# positive; removal is gated on detection, so it is suppressed too.
+_MIN_DETECT_SHORT_SIDE = 200
+
 
 @dataclass(frozen=True)
 class TextMarkConfig:
@@ -255,6 +268,17 @@ class TextMarkEngine:
         c = self.config
         det = TextMarkDetection()
         if image is None or image.size == 0:
+            return det
+        # Guard against the small-image NCC-noise false positive (see
+        # _MIN_DETECT_SHORT_SIDE): an icon/thumbnail is too small to carry a real
+        # text label, and the degraded few-pixel template spuriously correlates.
+        if min(image.shape[:2]) < _MIN_DETECT_SHORT_SIDE:
+            logger.debug(
+                "%s detect: image short side %d < %d; too small to carry the mark, skipping.",
+                c.name,
+                min(image.shape[:2]),
+                _MIN_DETECT_SHORT_SIDE,
+            )
             return det
         loc = self.locate(image)
         box = self.extract_mask(image, loc)  # box-sized mask (== old full-frame cropped to bbox)
