@@ -11,7 +11,7 @@ that mask to ONE shared, swappable fill backend (``region_eraser``: cv2 Telea/NS
 MI-GAN, or big-LaMa). No mark carries a reverse-alpha step any more: the old
 ``original = (wm - a*logo)/(1-a)`` recovery depended on a fixed captured alpha map
 at a fixed position, broke whenever a vendor re-rendered or moved its mark, and was
-not colour-lossless even with the right map (it amplifies quantization/JPEG-chroma
+not color-lossless even with the right map (it amplifies quantization/JPEG-chroma
 error by ``1/(1-a)`` -- the "the color just changed, not removed" reports). The
 localizer stays cheap (cv2/numpy, CPU) so a memory-tight caller can run it on a
 small worker; the heavy fill (MI-GAN / LaMa) is opt-in and chosen by the caller.
@@ -123,11 +123,8 @@ class Candidate:
 
     key: str
     label: str
-    location: str
-    region: Region
     detected_strict: bool
     detected_relaxed: bool
-    confidence: float
     features: dict[str, float]  # generic; both construction sites always supply it (empty when none)
 
 
@@ -279,7 +276,7 @@ def inpaint_model_available() -> bool:
     return region_eraser.migan_available() or region_eraser.lama_available()
 
 
-def preferred_inpaint_backend() -> str:
+def preferred_inpaint_backend() -> Literal["migan", "cv2"]:
     """Backend used by the ``auto`` fill: MI-GAN (light, droplet-friendly, the
     default) when its ONNX runtime is available, else cv2. big-LaMa is NOT auto-
     selected -- it is a heavier explicit opt-in via ``--backend lama`` (both models
@@ -293,7 +290,7 @@ def preferred_inpaint_backend() -> str:
 def resolve_backend(backend: Backend) -> Literal["cv2", "migan", "lama"]:
     """Resolve ``auto`` to the preferred installed backend; pass the rest through."""
     if backend == "auto":
-        return "migan" if preferred_inpaint_backend() == "migan" else "cv2"
+        return preferred_inpaint_backend()
     return backend
 
 
@@ -494,11 +491,7 @@ def _build_candidates(image: NDArray[Any]) -> list[Candidate]:
         strict = m.detect(image, provenance=False)
         relaxed = m.detect(image, provenance=True)
         feats = m.features(image) if (strict.detected or relaxed.detected) else {}
-        cands.append(
-            Candidate(
-                m.key, m.label, m.location, strict.region, strict.detected, relaxed.detected, strict.confidence, feats
-            )
-        )
+        cands.append(Candidate(m.key, m.label, strict.detected, relaxed.detected, feats))
     return cands
 
 

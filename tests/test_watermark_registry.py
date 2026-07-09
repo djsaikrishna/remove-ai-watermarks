@@ -176,7 +176,7 @@ class TestArbiter:
     @staticmethod
     def _c(key, *, strict=False, relaxed=False, flat=False):
         feats = {"footprint_flat": 1.0} if flat else {}
-        return reg.Candidate(key, f"L:{key}", "loc", (0, 0, 1, 1), strict, relaxed, 0.6, feats)
+        return reg.Candidate(key, f"L:{key}", strict, relaxed, feats)
 
     def _keys(self, cands, ctx):
         return {d.candidate.key for d in reg.decide(cands, ctx)}

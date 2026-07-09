@@ -2,7 +2,7 @@
 
 Position- and content-agnostic. You supply the rectangle(s); the eraser inpaints
 whatever is inside, so it removes any visible logo / watermark / object regardless
-of colour, style, or location. Localisation is the user's responsibility (pass the
+of color, style, or location. Localization is the user's responsibility (pass the
 box); restoration runs on CPU. This is the universal fallback for marks the
 deterministic per-generator engines (Gemini sparkle, Doubao) do not cover.
 
@@ -151,7 +151,7 @@ def erase_lama(image_bgr: NDArray[Any], mask: NDArray[Any]) -> NDArray[Any]:
     crop_mask = mask[cy0:cy1, cx0:cx1]
     ch, cw = crop.shape[:2]
 
-    # Resize crop + mask to the model size, normalise to [0,1] RGB CHW.
+    # Resize crop + mask to the model size, normalize to [0,1] RGB CHW.
     crop_rs = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
     mask_rs = cv2.resize(crop_mask, (size, size), interpolation=cv2.INTER_NEAREST)
     img_in = cv2.cvtColor(crop_rs, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0

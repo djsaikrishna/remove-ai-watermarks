@@ -81,7 +81,7 @@ def feather_weights(width: int, height: int, overlap: int) -> NDArray[Any]:
 
     Separable linear taper over ``overlap`` pixels from every edge (capped at
     half the tile so short tiles still taper symmetrically). Strictly positive
-    everywhere, so the normalised blend is well-defined even at an image corner
+    everywhere, so the normalized blend is well-defined even at an image corner
     that only one tile covers.
     """
     import numpy as np

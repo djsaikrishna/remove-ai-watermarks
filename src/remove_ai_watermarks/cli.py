@@ -699,7 +699,7 @@ def cmd_erase(
     """Erase arbitrary region(s) from an image via inpainting.
 
     Universal and position-agnostic: removes any logo / watermark / object inside
-    the boxes you pass, regardless of colour or location. Runs on CPU. Use this
+    the boxes you pass, regardless of color or location. Runs on CPU. Use this
     for marks the dedicated ``visible`` engines (Gemini, Doubao) do not cover.
     """
     from remove_ai_watermarks.region_eraser import erase
