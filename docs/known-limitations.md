@@ -9,6 +9,30 @@ measurements, incident history, oracle runs, and the reasoning behind each
 decision. Read the relevant section here before changing the diffusion
 pipelines, strength defaults, or metadata coverage.
 
+## Visible-mark fill quality is background- and backend-dependent
+
+Visible-mark removal is localize -> fill (the reverse-alpha pixel recovery was
+dropped; see `docs/module-internals.md`). The fill only touches the mark's
+footprint, so there is never collateral damage outside it, and whether the mark
+is *removed* is fill-independent -- cv2, MI-GAN and LaMa all strip the mark's
+shape. What varies is the *quality of the recovered region*, and it depends on
+the background:
+
+- **Flat backgrounds:** every backend is clean; cv2 is often the crispest.
+- **Textured / regular-structured backgrounds** (fabric, foliage, a lattice or
+  grid): an inpaint can only guess the hidden pixels. `cv2` (the classical
+  no-deps floor) visibly smears; `migan` (light, learned) can leave a ghost or
+  hallucinate structure; `lama` (heavy, learned) is the most reliable and
+  recovers structure best.
+
+The old reverse-alpha recovered the *true* pixels under a well-captured, static
+mark, so on structured backgrounds it was sometimes cleaner than any inpaint.
+The trade for localize -> fill is robustness (it also handles moved / re-rendered
+marks and needs no per-mark alpha capture) and a simpler, swappable pipeline.
+`auto` resolves best-first (`LaMa > MI-GAN > cv2`) and warns once when it falls
+back to cv2 because no learned backend is installed; a memory-tight deployment
+that cannot afford LaMa's ~4.7 GB peak pins `--backend migan` explicitly.
+
 ## Invisible-pipeline resolution handling (native / 1024 floor / `--max-resolution`; MPS memory tiers)
 
 `invisible` pipeline processes at **native resolution for inputs whose long side is >= 1024px**, and **auto-upscales smaller inputs UP to a 1024px floor** (`min_resolution=1024`, the default; `--min-resolution 0` disables) before diffusion -- SDXL img2img distorts badly on a tiny latent (a 381x512 portrait wrecks at native, the #36 follow-up), and the output is restored to the original input size so the floor is a transparent quality boost (it adds time/memory on small inputs). The floor upscale uses Lanczos by default; **`--upscaler esrgan`** (opt-in, the `esrgan` extra) runs Real-ESRGAN first for better detail before the Lanczos resize to the exact target (`upscaler.py` / `InvisibleEngine._esrgan_upscale`, falls back to Lanczos if the extra is absent). `max_resolution=0` (default) means no downscale cap, matching the hosted raiw.cc backend (fal fast-sdxl, no pre-downscale). The old forced downscale-to-1024 -> upscale-back round-trip for LARGE images was the main quality loss (issue #10) and is gone; at strength ~0.05 SDXL img2img does not need a downscale.
