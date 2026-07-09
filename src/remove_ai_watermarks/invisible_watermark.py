@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
     from pathlib import Path
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 # Known 48-bit ``bits`` watermarks (dwtDct, no key), name -> message integer.
 _BITS_48: dict[str, int] = {
@@ -96,7 +96,7 @@ def detect_invisible_watermark(image_path: Path) -> str | None:
             if _bits_match(value, ref) >= _MATCH_48:
                 return name
     except Exception as exc:  # decode can fail on tiny images
-        log.debug("48-bit watermark decode failed for %s: %s", image_path, exc)
+        logger.debug("48-bit watermark decode failed for %s: %s", image_path, exc)
 
     # 136-bit default string watermark (SD 1.x / 2.x).
     try:
@@ -104,6 +104,6 @@ def detect_invisible_watermark(image_path: Path) -> str | None:
         if _bytes_match_frac(raw, _SD1_STRING) >= _MATCH_SD1_FRAC:
             return "Stable Diffusion 1.x / 2.x"
     except Exception as exc:
-        log.debug("string watermark decode failed for %s: %s", image_path, exc)
+        logger.debug("string watermark decode failed for %s: %s", image_path, exc)
 
     return None

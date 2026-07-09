@@ -33,7 +33,7 @@ from remove_ai_watermarks.metadata import (
     IPTC_AI_MARKERS,
 )
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 # Top-level box types that may carry AI provenance. ``uuid`` boxes are checked
 # against ``C2PA_UUID`` / AI-label markers before being stripped; ``jumb`` boxes
@@ -188,7 +188,7 @@ def strip_c2pa_boxes(data: bytes) -> tuple[bytes, int]:
     # would silently truncate the file from the bad box to EOF -- worse than not
     # stripping. If the walk did not consume the whole input, return it unchanged.
     if consumed != len(data):
-        log.warning(
+        logger.warning(
             "ISOBMFF box walk stopped at offset %d of %d (malformed box); "
             "returning input unchanged to avoid truncation",
             consumed,

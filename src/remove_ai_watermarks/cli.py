@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-# --- plain-text output layer (replaces rich: no colors, no markup, no boxes) ---
+# ── plain-text output layer (replaces rich: no colors, no markup, no boxes) ──
 
 
 class _Table:
@@ -498,9 +498,7 @@ def _should_skip_invisible_scrub(force: bool, image_path: Path) -> bool:
     return not has_invisible_target(image_path)
 
 
-# -- Main group -------------------------------------------------------
-
-
+# ── Main group ──
 @click.group(invoke_without_command=True)
 @click.version_option(__version__, prog_name="remove-ai-watermarks")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging.")
@@ -520,9 +518,7 @@ def main(ctx: click.Context, verbose: bool) -> None:
         click.echo(ctx.get_help())
 
 
-# -- Visible (Gemini) watermark removal -------------------------------
-
-
+# ── Visible (Gemini) watermark removal ──
 @main.command("visible")
 @click.argument("source", type=click.Path(exists=True, path_type=Path))
 @click.option(
@@ -637,9 +633,7 @@ def cmd_visible(
     console.print(f"  Saved: {output}  ({size_kb:.0f} KB, {elapsed:.2f}s)")
 
 
-# -- Universal region eraser -----------------------------------------
-
-
+# ── Universal region eraser ──
 def _parse_region(spec: str) -> tuple[int, int, int, int]:
     """Parse an ``x,y,w,h`` region string into a 4-int tuple."""
     parts = spec.replace(" ", "").split(",")
@@ -729,9 +723,7 @@ def cmd_erase(
     console.print(f"  Erased {len(boxes)} region(s) -> {output}  ({size_kb:.0f} KB, {elapsed:.2f}s)")
 
 
-# -- Invisible watermark removal -------------------------------------
-
-
+# ── Invisible watermark removal ──
 @main.command("invisible")
 @click.argument("source", type=click.Path(exists=True, path_type=Path))
 @click.option(
@@ -867,9 +859,7 @@ def cmd_invisible(
     console.print(f"\n  Saved: {result_path}  ({size_kb:.0f} KB, {elapsed:.1f}s)")
 
 
-# -- Metadata operations ---------------------------------------------
-
-
+# ── Metadata operations ──
 @main.command("metadata")
 @click.argument("source", type=click.Path(exists=True, path_type=Path))
 @click.option("--check", is_flag=True, help="Check for AI metadata (don't modify).")
@@ -926,9 +916,7 @@ def cmd_metadata(
     console.print(f"  AI metadata stripped -> {out}")
 
 
-# -- Provenance identification ---------------------------------------
-
-
+# ── Provenance identification ──
 @main.command("identify")
 @click.argument("source", type=click.Path(exists=True, path_type=Path))
 @click.option(
@@ -997,9 +985,7 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
             console.print(f"  - {c}")
 
 
-# -- Combined "all" mode ----------------------------------------------
-
-
+# ── Combined "all" mode ──
 @main.command("all")
 @click.argument("source", type=click.Path(exists=True, path_type=Path))
 @click.option(
@@ -1102,7 +1088,7 @@ def cmd_all(
 
         os.close(tmp_fd)
 
-        # -- Step 1: Visible watermark --------------------------------
+        # ── Step 1: Visible watermark ──
         console.print("\n  1) Visible watermark removal")
         image, alpha = image_io.read_bgr_and_alpha(source)
         if image is None:
@@ -1124,7 +1110,7 @@ def cmd_all(
         # Save to temp file for invisible engine input (preserve alpha if present)
         image_io.write_bgr_with_alpha(tmp_path, result, alpha)
 
-        # -- Step 2: Invisible watermark ------------------------------
+        # ── Step 2: Invisible watermark ──
         console.print("\n  2) Invisible watermark removal")
         from remove_ai_watermarks.invisible_engine import is_available as invisible_available
 
@@ -1188,7 +1174,7 @@ def cmd_all(
             )
             console.print("    Invisible watermark removed")
 
-        # -- Step 3: Metadata -----------------------------------------
+        # ── Step 3: Metadata ──
         console.print("\n  3) AI metadata stripping")
         try:
             from remove_ai_watermarks.metadata import remove_ai_metadata
@@ -1198,7 +1184,7 @@ def cmd_all(
         except Exception as e:
             console.print(f"    Warning: Metadata strip failed: {e}")
 
-        # -- Write final result ----------------------------------------
+        # ── Write final result ──
         # The invisible step (and downstream cv2.IMREAD_COLOR paths) drops alpha,
         # so re-attach the original alpha plane unchanged when writing the final
         # output for transparent formats.
@@ -1214,7 +1200,7 @@ def cmd_all(
         if tmp_path.exists():
             tmp_path.unlink()
 
-    # -- Done -----------------------------------------------------
+    # ── Done ──
     elapsed = time.monotonic() - t0
     size_kb = output.stat().st_size / 1024
     console.print(f"\n  Done: {output}  ({size_kb:.0f} KB, {elapsed:.1f}s total)")
@@ -1238,9 +1224,7 @@ def cmd_all(
         raise SystemExit(1)
 
 
-# -- Batch command ----------------------------------------------------
-
-
+# ── Batch command ──
 def _process_batch_image(
     ctx: click.Context,
     img_path: Path,

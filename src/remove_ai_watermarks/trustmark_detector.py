@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pathlib import Path
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 # Adobe ships Variant P in production (com.adobe.trustmark.P).
 _MODEL_TYPE = "P"
@@ -94,10 +94,10 @@ def detect_trustmark(image_path: Path) -> str | None:
         if not wm_present:
             return None
         if not _survives_reencode(decoder, cover, wm_schema):
-            log.debug("TrustMark decode for %s did not survive re-encode; treating as false positive", image_path)
+            logger.debug("TrustMark decode for %s did not survive re-encode; treating as false positive", image_path)
             return None
     except Exception as exc:  # model download / decode failure / unreadable image
-        log.debug("TrustMark decode failed for %s: %s", image_path, exc)
+        logger.debug("TrustMark decode failed for %s: %s", image_path, exc)
         return None
     return f"Adobe TrustMark (variant {_MODEL_TYPE}, schema {wm_schema})"
 

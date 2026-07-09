@@ -41,7 +41,7 @@ from remove_ai_watermarks.noai.constants import (
     SYNTHID_C2PA_ISSUERS,
 )
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 # Official C2PA reader (c2pa-python, a core dependency). It is the primary,
 # spec-tracking manifest parser; the hand-rolled caBX/CBOR scanner below stays as
@@ -96,7 +96,7 @@ def _read_manifest_store_impl(path_str: str) -> str | None:
     try:
         reader = _C2paReader.try_create(path_str)
     except Exception as exc:  # malformed manifest, unsupported container, etc.
-        log.debug("c2pa Reader could not parse %s: %s", path_str, exc)
+        logger.debug("c2pa Reader could not parse %s: %s", path_str, exc)
         return None
     if reader is None:
         return None
@@ -104,7 +104,7 @@ def _read_manifest_store_impl(path_str: str) -> str | None:
         with reader:
             return reader.json()
     except Exception as exc:  # pragma: no cover - reader opened but json() failed
-        log.debug("c2pa Reader.json() failed on %s: %s", path_str, exc)
+        logger.debug("c2pa Reader.json() failed on %s: %s", path_str, exc)
         return None
 
 

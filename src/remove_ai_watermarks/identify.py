@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 
     from remove_ai_watermarks.watermark_registry import MarkDetection
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 # How much of a non-PNG container to binary-scan for the C2PA issuer.
 _SCAN_BYTES = 1024 * 1024
@@ -393,7 +393,7 @@ def _visible_sparkle(image_path: Path, *, image: NDArray[Any] | None = None) -> 
     try:
         from remove_ai_watermarks.gemini_engine import detect_sparkle_confidence
     except Exception as exc:  # cv2/engine assets missing
-        log.debug("visible-sparkle detector unavailable: %s", exc)
+        logger.debug("visible-sparkle detector unavailable: %s", exc)
         return None
     return detect_sparkle_confidence(image_path, image=image)
 
@@ -424,7 +424,7 @@ def _visible_text_marks(image_path: Path, *, image: NDArray[Any] | None = None) 
         from remove_ai_watermarks.image_io import imread
         from remove_ai_watermarks.watermark_registry import get_mark
     except Exception as exc:  # cv2/engine assets missing
-        log.debug("visible-mark detectors unavailable: %s", exc)
+        logger.debug("visible-mark detectors unavailable: %s", exc)
         return []
     if image is None:
         image = imread(image_path)
@@ -435,7 +435,7 @@ def _visible_text_marks(image_path: Path, *, image: NDArray[Any] | None = None) 
         try:
             det = get_mark(key).detect(image)
         except Exception as exc:  # one engine failing must not break identify
-            log.debug("visible-mark %s detector failed: %s", key, exc)
+            logger.debug("visible-mark %s detector failed: %s", key, exc)
             continue
         if det.detected:
             detections.append(det)
@@ -719,7 +719,7 @@ def identify(image_path: Path, *, check_visible: bool = True, check_invisible: b
 
             vis_image = imread(image_path)
         except Exception as exc:  # cv2 missing - detectors fall back / no-op
-            log.debug("visible-mark decode unavailable: %s", exc)
+            logger.debug("visible-mark decode unavailable: %s", exc)
 
     # ── Visible Gemini sparkle (fallback for stripped-metadata case) ─
     sparkle_conf = _visible_sparkle(image_path, image=vis_image) if check_visible else None
@@ -798,6 +798,6 @@ def has_invisible_target(image_path: Path) -> bool:
     try:
         report = identify(image_path, check_visible=False, check_invisible=True)
     except Exception:  # unreadable / detector error -> do not skip the removal
-        log.debug("has_invisible_target: identify failed, defaulting to run", exc_info=True)
+        logger.debug("has_invisible_target: identify failed, defaulting to run", exc_info=True)
         return True
     return report.ai_from_metadata
