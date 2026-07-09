@@ -1,55 +1,60 @@
-"""Inpaint-fallback visible removal: method resolution, footprint masks, dispatch.
+"""Visible removal via localize -> fill: backend resolution, footprint masks, dispatch.
 
-The inpaint path erases the mark footprint (MI-GAN when the ``migan`` extra is
-installed, else cv2) instead of reverse-alpha, so a mark needs no captured alpha
-map for removal (only for the footprint silhouette). ``auto`` is deterministic:
-reverse-alpha for capture marks, inpaint for capture-less. These tests avoid any
-ONNX model download by pinning the backend to cv2 via ``preferred_inpaint_backend``;
-only pure cv2/numpy paths run.
+Every known mark is removed by LOCALIZING it to a full-frame footprint mask and
+handing that mask to ONE shared fill backend (MI-GAN when the ``migan`` extra is
+installed, else cv2). These tests avoid any ONNX model download by pinning the
+backend to cv2; only pure cv2/numpy paths run.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import cv2
 import numpy as np
-import pytest
 
 from remove_ai_watermarks import watermark_registry as registry
+from remove_ai_watermarks._text_mark_engine import load_alpha_template
 from remove_ai_watermarks.doubao_engine import DoubaoEngine
 from remove_ai_watermarks.gemini_engine import GeminiEngine
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _compose_textmark(engine, bg: float = 120.0, w: int = 1024, h: int = 1024):
     """Composite the engine's captured mark onto a flat ``bg`` at full opacity so
     the mark is detectable. Returns ``(watermarked_uint8, (ax, ay, gw, gh))``."""
+    c = engine.config
+    at = load_alpha_template(c.asset_name)
+    gw = max(c.min_gw, int(c.alpha_width_frac * w))
+    gh = max(4, int(c.alpha_height_frac * w))
+    margin = int(0.015 * w)
+    ax = (w - margin - gw) if c.corner == "br" else margin
+    ay = h - margin - gh
+    block = cv2.resize(at, (gw, gh))
     img = np.full((h, w, 3), float(bg), np.float32)
-    block, (ax, ay, gw, gh) = engine._fixed_alpha_map(img)
     a = np.clip(block, 0.0, 0.99)[:, :, None]
-    logo = np.array(engine.config.alpha_logo_bgr, np.float32)
-    img[ay : ay + gh, ax : ax + gw] = img[ay : ay + gh, ax : ax + gw] * (1 - a) + logo * a
+    img[ay : ay + gh, ax : ax + gw] = img[ay : ay + gh, ax : ax + gw] * (1 - a) + 255.0 * a
     return np.clip(img, 0, 255).astype(np.uint8), (ax, ay, gw, gh)
 
 
-class TestResolveMethod:
-    @pytest.mark.parametrize("explicit", ["reverse-alpha", "inpaint"])
-    def test_explicit_passthrough(self, explicit: str) -> None:
-        # capture mark: the explicit method passes through unchanged
-        assert registry.resolve_removal_method(explicit, True) == explicit  # type: ignore[arg-type]
-        # capture-less: reverse-alpha is impossible, so it collapses to inpaint
-        expected = "inpaint" if explicit == "reverse-alpha" else explicit
-        assert registry.resolve_removal_method(explicit, False) == expected  # type: ignore[arg-type]
+class TestResolveBackend:
+    def test_auto_resolves_to_installed_backend(self) -> None:
+        # auto picks the preferred installed model (MI-GAN) or cv2; either is fine.
+        assert registry.resolve_backend("auto") in {"cv2", "migan"}
 
-    def test_auto_uses_reverse_alpha_for_capture_marks(self) -> None:
-        # auto is deterministic and model-independent: reverse-alpha where a capture
-        # exists (cleaner + lighter than inpaint), inpaint only where it does not.
-        assert registry.resolve_removal_method("auto", True) == "reverse-alpha"
+    def test_cv2_passthrough(self) -> None:
+        assert registry.resolve_backend("cv2") == "cv2"
 
-    def test_auto_uses_inpaint_for_capture_less(self) -> None:
-        assert registry.resolve_removal_method("auto", False) == "inpaint"
+    def test_lama_passthrough(self) -> None:
+        assert registry.resolve_backend("lama") == "lama"
 
 
 class TestFootprintMask:
     def test_textmark_footprint_geometry(self) -> None:
-        mask = DoubaoEngine().footprint_mask(np.full((1024, 1024, 3), 120, np.uint8))
+        # A clean flat corner has no glyph, so force=True yields the geometry box.
+        mask = DoubaoEngine().footprint_mask(np.full((1024, 1024, 3), 120, np.uint8), force=True)
         assert mask is not None
         assert mask.shape == (1024, 1024)
         assert mask.dtype == np.uint8
@@ -71,41 +76,30 @@ class TestFootprintMask:
         assert forced.any()
 
 
-class TestInpaintDispatch:
-    """Force the cv2 backend (patch preferred_inpaint_backend) so no ONNX model
-    downloads; the dispatch/gating logic is backend-agnostic."""
+class TestFillDispatch:
+    """Force the cv2 backend so no ONNX model downloads; the dispatch/gating logic
+    is backend-agnostic."""
 
-    def test_clean_image_is_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(registry, "preferred_inpaint_backend", lambda: "cv2")
+    def test_clean_image_is_untouched(self) -> None:
         img = np.full((1024, 1024, 3), 120, np.uint8)
-        out, region = registry.get_mark("doubao").remove(img, method="inpaint")
+        out, region = registry.get_mark("doubao").remove(img, backend="cv2")
         assert region is None
         assert np.array_equal(out, img)  # not detected, not forced -> no-op
 
-    def test_forced_inpaint_edits_only_footprint(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(registry, "preferred_inpaint_backend", lambda: "cv2")
+    def test_forced_fill_edits_only_footprint(self) -> None:
         img, (ax, ay, gw, gh) = _compose_textmark(DoubaoEngine())
-        out, _ = registry.get_mark("doubao").remove(img, method="inpaint", force=True)
+        out, _ = registry.get_mark("doubao").remove(img, backend="cv2", force=True)
         assert not np.array_equal(out[ay : ay + gh, ax : ax + gw], img[ay : ay + gh, ax : ax + gw])
         assert np.array_equal(out[:200, :200], img[:200, :200])  # far corner untouched
 
-    def test_detected_inpaint_lowers_confidence(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(registry, "preferred_inpaint_backend", lambda: "cv2")
+    def test_detected_fill_lowers_confidence(self) -> None:
         mark = registry.get_mark("doubao")
         img, _ = _compose_textmark(DoubaoEngine())
         before = mark.detect(img)
         assert before.detected  # the composed mark is detectable
-        out, region = mark.remove(img, method="inpaint")
+        out, region = mark.remove(img, backend="cv2")
         assert region is not None
         assert mark.detect(out).confidence < before.confidence
-
-    def test_reverse_alpha_method_still_selectable(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(registry, "inpaint_model_available", lambda: True)  # would be inpaint on auto
-        img, _ = _compose_textmark(DoubaoEngine())
-        # explicit reverse-alpha bypasses the inpaint fallback even with a model present
-        out, region = registry.get_mark("doubao").remove(img, method="reverse-alpha")
-        assert region is not None
-        assert not np.array_equal(out, img)
 
 
 class TestBackendSelection:

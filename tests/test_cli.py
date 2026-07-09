@@ -172,7 +172,9 @@ class TestVisibleCommand:
         expected = sample_png.with_stem(sample_png.stem + "_clean")
         assert expected.exists()
 
-    def test_visible_no_inpaint(self, runner, sample_png, tmp_path):
+    def test_visible_backend_cv2(self, runner, sample_png, tmp_path):
+        # The old --inpaint/--no-inpaint flags are gone; the fill backend is picked
+        # with --backend (localize -> fill). cv2 needs no ONNX model.
         output = tmp_path / "clean.png"
         result = runner.invoke(
             main,
@@ -181,7 +183,8 @@ class TestVisibleCommand:
                 str(sample_png),
                 "-o",
                 str(output),
-                "--no-inpaint",
+                "--backend",
+                "cv2",
                 "--no-detect",
             ],
         )

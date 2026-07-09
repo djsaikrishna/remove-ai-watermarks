@@ -156,6 +156,29 @@ class TestHasAiMetadata:
         path.write_bytes(b"\xff\xd8\xff\xe1" + xmp + b"\xff\xd9")
         assert has_ai_metadata(path)
 
+    @pytest.mark.skipif(not SAMPLES_DIR.exists(), reason="data/samples not present")
+    def test_jpeg_metadata_strip_is_pixel_lossless(self, tmp_path: Path):
+        """A JPEG metadata strip must NOT re-encode the DCT scan: pixels stay
+        bit-identical, only the AI provenance APP segments are removed. Verified on real
+        committed fixtures -- grok-1.jpg (EXIF signature), flux-1.jpg (C2PA APP11)."""
+        import numpy as np
+
+        from remove_ai_watermarks import image_io
+        from remove_ai_watermarks.metadata import remove_ai_metadata
+
+        for name in ("grok-1.jpg", "flux-1.jpg"):
+            src = SAMPLES_DIR / name
+            if not src.exists():
+                continue
+            before = image_io.imread(str(src))
+            out = tmp_path / name
+            remove_ai_metadata(src, out)
+            after = image_io.imread(str(out))
+            assert before is not None
+            assert after is not None
+            assert np.array_equal(before, after), f"{name}: pixels changed (DCT was re-encoded)"
+            assert not has_ai_metadata(out), f"{name}: AI metadata survived the strip"
+
 
 class TestC2paMarkerIn:
     """The C2PA presence check requires a JUMBF wrapper or the C2PA uuid box, so

@@ -1,19 +1,22 @@
-"""Samsung Galaxy AI visible watermark removal engine.
+"""Samsung Galaxy AI visible watermark detector/localizer.
 
 Samsung's on-device Generative AI photo edits burn a visible "✦ Contenuti generati
 dall'AI" wordmark into the bottom-LEFT corner (the Italian locale variant calibrated
-here; the string is locale-specific). It is a faint, near-white semi-transparent
-overlay, the same overlay class as the Doubao/Jimeng marks but bottom-left.
+here; the string is locale-specific -- DETECTION only matches this locale's silhouette,
+so other locales are not yet detected, though the fill mask itself is locale-agnostic).
+It is a faint, near-white semi-transparent overlay, the same overlay class as the
+Doubao/Jimeng marks but bottom-left.
 
-Removal is **reverse-alpha blending** against a captured alpha map
-(``original = (wm - a*logo)/(1-a)``), always NCC-aligned to the actual mark plus a thin
-residual inpaint over the glyph footprint. This is one of the three text-mark engines
-that share :class:`remove_ai_watermarks._text_mark_engine.TextMarkEngine`; this module
+Detection matches the bundled glyph silhouette against the corner; removal is the
+shared **localize -> fill** (the glyph-bbox :meth:`footprint_mask` feeds
+``region_eraser``), NOT reverse-alpha. This is one of the three text-mark engines that
+share :class:`remove_ai_watermarks._text_mark_engine.TextMarkEngine`; this module
 supplies only Samsung's tuned :class:`TextMarkConfig` (bottom-LEFT corner, a lower glyph
-luma since the mark is faint, ``assets/samsung_alpha.png`` solved from the flat captures
-by ``scripts/visible_alpha_solve.py``). Samsung Galaxy AI edits are also caught by C2PA
-+ the ``genAIType`` marker, so this is the visible-mark *removal* path; it also feeds
-``identify`` as the medium-confidence ``visible_samsung`` signal via the registry.
+luma since the mark is faint, ``assets/samsung_alpha.png`` -- the detection silhouette,
+solved from the flat captures by ``scripts/visible_alpha_solve.py``). Samsung Galaxy AI
+edits are also caught by C2PA + the ``genAIType`` marker, so this is the visible-mark
+*removal* path; it also feeds ``identify`` as the medium-confidence ``visible_samsung``
+signal via the registry.
 """
 # The module-level _alpha_template / _glyph_silhouette / _template_match_score below
 # are thin test-facing shims (imported by tests/), so pyright's src-only pass sees them
@@ -48,21 +51,13 @@ TOPHAT_DELTA = 8
 DETECT_MIN_COVERAGE = 0.01
 DETECT_NCC_THRESHOLD = 0.40
 
-# Reverse-alpha geometry, solved by scripts/visible_alpha_solve.py from the flat gray
-# capture (native width 1086). Real photos are ~2958 wide, so the captured glyph is
-# upscaled; width-scale + NCC-align removes it cleanly (a flat capture at the real
-# resolution would make the alpha pixel-sharp -- an open quality upgrade).
+# Detection-silhouette geometry, solved by scripts/visible_alpha_solve.py from the flat
+# gray capture (native width 1086). Real photos are ~2958 wide, so the captured glyph is
+# upscaled; width-scale + NCC-align sizes the silhouette for the detection match (removal
+# is the template-free glyph-bbox footprint mask).
 _ALPHA_NATIVE_WIDTH = 1086
-_ALPHA_LOGO_BGR: tuple[float, float, float] = (255.0, 255.0, 255.0)
-_ALPHA_WIDTH_FRAC = 0.3195  # asset width / image width -- the alignment scale seed
+_ALPHA_WIDTH_FRAC = 0.3195  # asset width / image width -- sizes the detection silhouette
 _ALPHA_HEIGHT_FRAC = 0.0378
-_ALPHA_MARGIN_LEFT_FRAC = 0.0110
-_ALPHA_MARGIN_BOTTOM_FRAC = 0.0064
-# Wider scale search: the flat capture is far off the real-photo width.
-_ALPHA_ALIGN_SEARCH = (0.85, 1.18, 23)
-_RESIDUAL_ALPHA_FLOOR = 0.05
-_RESIDUAL_DILATE = 5
-_RESIDUAL_INPAINT_RADIUS = 2
 
 _CONFIG = TextMarkConfig(
     name="Samsung Galaxy AI",
@@ -81,14 +76,7 @@ _CONFIG = TextMarkConfig(
     detect_ncc_threshold=DETECT_NCC_THRESHOLD,
     alpha_width_frac=_ALPHA_WIDTH_FRAC,
     alpha_height_frac=_ALPHA_HEIGHT_FRAC,
-    alpha_margin_x_frac=_ALPHA_MARGIN_LEFT_FRAC,
-    alpha_margin_bottom_frac=_ALPHA_MARGIN_BOTTOM_FRAC,
-    alpha_align_search=_ALPHA_ALIGN_SEARCH,
     min_gw=16,
-    alpha_logo_bgr=_ALPHA_LOGO_BGR,
-    residual_alpha_floor=_RESIDUAL_ALPHA_FLOOR,
-    residual_dilate=_RESIDUAL_DILATE,
-    residual_inpaint_radius=_RESIDUAL_INPAINT_RADIUS,
 )
 
 SamsungDetection = TextMarkDetection
@@ -110,7 +98,7 @@ def _template_match_score(box_mask: NDArray[Any], image_width: int) -> float:
 
 
 class SamsungEngine(TextMarkEngine):
-    """Remove the visible Samsung Galaxy AI text mark (locate -> mask -> reverse-alpha)."""
+    """Detect/localize the visible Samsung Galaxy AI text mark (locate -> mask; mask feeds the fill)."""
 
     def __init__(self) -> None:
         super().__init__(_CONFIG)

@@ -6,8 +6,12 @@ so adding a new AI tool or metadata key requires updating only this file.
 
 from typing import NamedTuple
 
-# Supported image formats
-SUPPORTED_FORMATS = {".png", ".jpg", ".jpeg", ".webp"}
+# Supported image formats for the pixel/removal path (CLI input validation + batch
+# discovery). PNG/JPEG/WebP decode+encode via cv2; HEIC/HEIF/AVIF via the core
+# pillow-heif dep (image_io.imread Pillow fallback + imwrite _pil_write), so batch
+# now picks them up and the CLI no longer warns on an iPhone HEIC. JPEG-XL is left
+# out on purpose -- it is metadata/strip-only (no pixel decoder without pillow-jxl).
+SUPPORTED_FORMATS = {".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif", ".avif"}
 
 # AI-generated image metadata keys (Stable Diffusion, ComfyUI, Midjourney, etc.)
 AI_METADATA_KEYS = [

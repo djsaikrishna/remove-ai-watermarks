@@ -1,16 +1,17 @@
-"""Gemini visible watermark removal engine.
+"""Gemini visible-sparkle detector and localizer (cv2/numpy, no GPU).
 
-Port of the GeminiWatermarkTool reverse-alpha-blending algorithm from C++ to Python.
-Original author: Allen Kuo (allenk) — https://github.com/allenk/GeminiWatermarkTool
+Locates the Google Gemini / Nano Banana sparkle so the shared fill (region_eraser)
+can inpaint it. Detection is a multi-scale NCC search against the captured sparkle
+alpha template (ported from GeminiWatermarkTool's Snap Engine; original author
+Allen Kuo (allenk), https://github.com/allenk/GeminiWatermarkTool), scored by a
+spatial + gradient + variance fusion with a false-positive gate. ``footprint_mask``
+returns the sparkle footprint (captured alpha thresholded low to include the halo,
+then dilated) as a full-frame mask for the fill.
 
-The Gemini AI watermark is applied using alpha blending:
-    watermarked = a * logo + (1 - a) * original
-
-We reverse this to recover the original:
-    original = (watermarked - a * logo) / (1 - a)
-
-The alpha maps are derived from background captures of the Gemini watermark
-on pure-black backgrounds (48x48 for small images, 96x96 for large images).
+The captured alpha maps are background captures of the sparkle on pure-black
+backgrounds (48x48 for small images, 96x96 for large). NB: they are used here only
+to DETECT and to shape the removal mask -- the old reverse-alpha pixel recovery
+(``original = (watermarked - a*logo)/(1-a)``) is gone; removal is localize -> fill.
 """
 
 # cv2/numpy boundary: cv2 and numpy ship no usable type info for the array ops
@@ -23,7 +24,7 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -126,51 +127,16 @@ def _load_embedded_asset(name: str) -> NDArray[Any]:
 
 
 class GeminiEngine:
-    """Engine for removing visible Gemini watermarks via reverse alpha blending.
+    """Detects and localizes the visible Gemini sparkle for the shared fill removal.
 
-    This is a Python port of the GeminiWatermarkTool C++ engine.
+    The multi-scale NCC detection is a Python port of the GeminiWatermarkTool C++
+    Snap Engine; ``footprint_mask`` turns a detection into a removal mask.
     """
 
-    # Footprint pixels with alpha at/above this are the sparkle body; below it the
-    # mark barely affects the pixel, so those are excluded from both the
-    # over-subtraction test and the inpaint mask.
-    _FOOTPRINT_ALPHA = 0.1
-    # If more than this fraction of footprint pixels over-subtract (numerator < 0),
-    # the fixed alpha does not match this image's sparkle and reverse-alpha would
-    # punch a dark pit -- inpaint instead. demo_banana measures 0.0 (reverse-alpha
-    # kept), the issue #30 dark-grass image measures ~0.61 (inpaint), so the 0.05
-    # gate separates them with a wide margin.
-    _OVERSUB_FOOTPRINT_FRAC = 0.05
-
-    # Mid-tone over-subtraction (2026-06-18 prod "the color just changed, not removed"
-    # report). The numerator fraction above only trips when reverse-alpha drives a
-    # footprint pixel fully NEGATIVE -- the dark-background black-pit case. On a MID-TONE
-    # background a sparkle fainter than the captured alpha is over-subtracted into a
-    # visibly DARKER-than-background diamond while no pixel ever crosses zero, so the
-    # numerator gate misses it and ships the dark mark. Predict the reverse-alpha output
-    # at the bright core, (core - a*logo)/(1-a); when it lands more than this many gray
-    # levels BELOW the local background ring, reverse-alpha would leave a dark diamond --
-    # inpaint instead. Calibrated wide: clean removals predict within ~12 of background
-    # (demo_banana ~-1, a bright-bg sparkle ~-12), the prod regression predicts ~-40 and
-    # the issue #30 dark case ~-82, so 25 separates keep-vs-inpaint with margin.
-    _OVERSUB_DARK_MARGIN = 25.0
-
-    # Per-image alpha gain (under-subtraction fix). The captured alpha peaks ~0.51
-    # (a ~51%-opaque sparkle). Some real Gemini sparkles are rendered MORE opaque,
-    # so the fixed alpha under-subtracts and reverse-alpha leaves a bright residual
-    # the detector still fires on (~11% of marks on the spaces corpus). Estimate
-    # this image's effective sparkle opacity from the bright core vs the local
-    # background and scale the alpha to match, capped so alpha stays < 0.99. The
-    # gain is clamped to >= 1.0 so it only ever STRENGTHENS removal: ~1.0 when the
-    # sparkle matches the capture (working cases unchanged), >1 when more opaque.
-    # On the spaces corpus the gain cleanly separates -- under-removed marks ~1.47,
-    # cleanly-removed ~1.00. 1.94 is the cap that reaches alpha 0.99 from 0.51.
-    _ALPHA_GAIN_MAX = 1.94
-    _ALPHA_GAIN_CORE_FRAC = 0.8  # body pixels at >= this * peak alpha define the core
-    # Deadband: apply the gain only above this, so a sparkle that already matches the
-    # capture (estimated gain ~1.0-1.04 from background noise) stays byte-identical to
-    # the pre-fix output. Under-removed marks estimate >= 1.26, well clear of the band.
-    _ALPHA_GAIN_DEADBAND = 1.05
+    # Body pixels at >= this fraction of the peak captured alpha define the sparkle
+    # "core", sampled by the detection FP-gate's core-vs-ring brightness margin
+    # (:meth:`_core_and_bg`).
+    _CORE_ALPHA_FRAC = 0.8
 
     # Sparkle false-positive gate. A real Gemini sparkle is a bright WHITE overlay,
     # so its core sits above the local background; a shape-only NCC match on ornate
@@ -200,23 +166,6 @@ class GeminiEngine:
     # regress a dark/mid sparkle (already kept by margin) or a white-bg one (kept by
     # confidence >= 0.65, above the gate).
     _SPARKLE_FP_GRAD = 0.55
-
-    # Self-verify fallback. The gain estimate corrects most under-subtractions, but
-    # on the spaces corpus a tail of strong sparkles still survived reverse-alpha
-    # (a few px of position jitter or a gain estimate the [1.0, 1.94] clamp could
-    # not fully reach). After the reverse blend, re-detect; if a sparkle this strong
-    # remains, inpaint the footprint and keep that ONLY when it lowers the re-detect
-    # confidence. Purely additive: the common clean removal re-detects below this and
-    # is returned untouched. Threshold matches the registry's real fail line (0.5),
-    # so it triggers exactly on the cases that would otherwise read as not-removed
-    # (rescued 4 of 15 corpus fails, 0 regressions). An offset+scale alignment search
-    # was prototyped on the remaining 11 but REJECTED: it only lowered the shape-NCC by
-    # moving the reverse-alpha to a different placement that left the sparkle as bright
-    # or brighter (NCC-gaming, not removal), so a brightness sanity check rejected every
-    # one. The footprint inpaint physically reconstructs the slot from its surroundings,
-    # so its rescues are genuine; the survivors are near-white ill-conditioning or
-    # detector false positives that no reverse-alpha placement fixes.
-    _VERIFY_FALLBACK_CONF = 0.5
 
     # Corner promotion (issue #36): the size weight that suppresses tiny-patch
     # false positives also buries a small, near-perfect sparkle when a larger,
@@ -323,8 +272,18 @@ class GeminiEngine:
         self,
         image: NDArray[Any],
         force_size: WatermarkSize | None = None,
+        *,
+        trust_provenance: bool = False,
     ) -> DetectionResult:
-        """Detect Gemini watermark using multi-scale Snap Engine logic (ported from C++ vendor algorithm)."""
+        """Detect Gemini watermark using multi-scale Snap Engine logic (ported from C++ vendor algorithm).
+
+        ``trust_provenance`` signals that external metadata already proves this is a
+        Google generation (C2PA issuer "Google"/"Gemini"). The false-positive gate
+        exists only to reject content that shape-matches the sparkle on NON-Google
+        images (Doubao text, ornate corners); when provenance confirms Google, that
+        gate would demote a genuine sparkle the vendor moved/re-rendered (bigger,
+        lighter, shifted), so it is skipped. The caller (registry) still applies the
+        relaxed provenance trust gate to the returned confidence."""
         result = DetectionResult()
 
         if image is None or image.size == 0:
@@ -421,7 +380,7 @@ class GeminiEngine:
         # incl. bright). Demote when both are weak -- this catches the dark/mid no-core
         # FP (low margin) AND the bright-background smooth-blob FP (high margin but low
         # gradient), which the margin check alone misses. See _SPARKLE_FP_GRAD.
-        if confidence < self._SPARKLE_FP_CONF:
+        if confidence < self._SPARKLE_FP_CONF and not trust_provenance:
             margin = self._core_ring_margin(image, self.get_interpolated_alpha(best_scale), (pos_x, pos_y))
             low_margin = margin is not None and margin < self._SPARKLE_FP_MARGIN
             low_grad = grad_score < self._SPARKLE_FP_GRAD
@@ -530,87 +489,25 @@ class GeminiEngine:
 
     # ── Removal ──────────────────────────────────────────────────────
 
-    def remove_watermark(
-        self,
-        image: NDArray[Any],
-        force_size: WatermarkSize | None = None,
-    ) -> NDArray[Any]:
-        """Remove Gemini visible watermark from an image using reverse alpha blending.
+    # Footprint mask for the localize -> fill removal path. The mask must cover the
+    # WHOLE sparkle including its faint semi-transparent halo, not just the bright
+    # core, or the fill leaves a visible ring. Threshold the captured alpha low
+    # (>_MASK_ALPHA catches the halo the core-only 0.10 misses) then dilate by a
+    # sparkle-relative margin so alignment slop and the outermost halo are absorbed.
+    _MASK_ALPHA = 0.04
+    _MASK_DILATE_FRAC = 0.18  # dilation radius as a fraction of the sparkle scale
 
-        No-op when the detector does not find a watermark: returns an unmodified
-        copy. Reverse alpha blending applied where no sparkle exists creates a
-        visible inverse artifact, so we refuse to touch pixels without a positive
-        detection. To bypass detection (e.g. you know the exact region), use
-        ``remove_watermark_custom``.
-
-        Args:
-            image: BGR image as numpy array (will NOT be modified in-place).
-            force_size: Force a specific watermark size (auto-detect if None).
-
-        Returns:
-            Cleaned BGR image as numpy array, or an unmodified copy when no
-            watermark is detected.
-        """
-        # Normalize to 3-channel BGR up front: 2D grayscale (no channel axis) and
-        # 4-channel BGRA both reach this public entry point and would otherwise
-        # crash on the channel-count checks / downstream 3-channel math.
-        result = image_io.to_bgr(image.copy())
-
-        size = force_size or get_watermark_size(result.shape[1], result.shape[0])
-
-        # Detect dynamic position & size (on the normalized 3-channel image so a
-        # grayscale/BGRA input does not crash the detector).
-        detection = self.detect_watermark(result, force_size=size)
-
-        if not detection.detected:
-            logger.debug(
-                "No watermark detected (conf=%.3f); returning image unchanged.",
-                detection.confidence,
-            )
-            return result
-
-        pos = (detection.region[0], detection.region[1])
-        alpha_map = self.get_interpolated_alpha(detection.region[2])
-        # Match the captured alpha to this image's sparkle opacity (under-subtraction
-        # fix): a more-opaque-than-captured sparkle would otherwise leave a bright
-        # residual. gain == 1.0 leaves the working cases byte-identical.
-        gain = self._estimate_alpha_gain(result, alpha_map, pos)
-        if gain > self._ALPHA_GAIN_DEADBAND:
-            alpha_map = np.clip(alpha_map * gain, 0.0, 0.99)
-        logger.debug(
-            "Removing watermark at (%d, %d) size %dx%d [conf=%.3f]",
-            pos[0],
-            pos[1],
-            detection.region[2],
-            detection.region[3],
-            detection.confidence,
-        )
-
-        # The captured alpha map (max ~0.51 = a ~50%-opaque white sparkle) is exact
-        # only when the real mark's effective opacity matches it. On a dark/textured
-        # background the sparkle's effective alpha is lower than the capture, so the
-        # fixed-alpha reverse blend OVER-subtracts and drives the footprint to black --
-        # the "white sparkle turns into a black pit" bug (issue #30). The signature is
-        # a large fraction of footprint pixels whose numerator (watermarked - a*logo)
-        # goes negative, which is physically impossible under a brightening overlay.
-        # In that case inpaint the small footprint from the surrounding pixels instead;
-        # on a bright background no pixel over-subtracts, so reverse-alpha is used and
-        # the result is byte-identical to before (verified on demo_banana: 0% vs 61%).
-        if self._reverse_alpha_oversubtracts(result, alpha_map, pos):
-            logger.debug("Reverse-alpha over-subtracts on this background; inpainting sparkle footprint.")
-            self._inpaint_footprint(result, alpha_map, pos)
-        else:
-            self._reverse_alpha_blend(result, alpha_map, pos)
-        return self._verify_and_repair(result, alpha_map, pos, size)
-
-    def footprint_mask(self, image: NDArray[Any], *, force: bool = False, dilate: int = 13) -> NDArray[Any] | None:
+    def footprint_mask(
+        self, image: NDArray[Any], *, force: bool = False, dilate: int | None = None
+    ) -> NDArray[Any] | None:
         """Full-frame uint8 mask (255 = sparkle) of the sparkle footprint, for the
-        inpaint-fallback removal path (LaMa / cv2), or None.
+        shared fill removal path (cv2 / MI-GAN / LaMa), or None.
 
-        The footprint is the interpolated captured alpha at the detected scale --
-        the same region reverse-alpha operates on. When ``force`` and nothing is
-        detected, falls back to the default sparkle slot for the image size (the
-        ``--no-detect`` path). The caller gates on the trust-confidence detection.
+        The footprint is the interpolated captured alpha at the detected scale,
+        thresholded LOW so the faint halo is included, then dilated by a
+        sparkle-relative margin. When ``force`` and nothing is detected, falls back to
+        the default sparkle slot for the image size (the ``--no-detect`` path). The
+        caller gates on the trust-confidence detection.
         """
         image = image_io.to_bgr(image)
         h, w = image.shape[:2]
@@ -628,47 +525,15 @@ class GeminiEngine:
         if fp is None:
             return None
         aroi, (y1, y2, x1, x2) = fp
-        sil = (aroi > 0.10).astype(np.uint8) * 255
+        sil = (aroi > self._MASK_ALPHA).astype(np.uint8) * 255
         if int((sil > 0).sum()) == 0:
             return None
         mask = np.zeros((h, w), np.uint8)
         mask[y1:y2, x1:x2] = sil
-        if dilate > 0:
-            mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1)))
+        d = dilate if dilate is not None else max(13, int(scale * self._MASK_DILATE_FRAC))
+        if d > 0:
+            mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1)))
         return mask
-
-    def remove_watermark_custom(
-        self,
-        image: NDArray[Any],
-        region: tuple[int, int, int, int],
-    ) -> NDArray[Any]:
-        """Remove watermark from a custom region with interpolated alpha map.
-
-        Args:
-            image: BGR image (will NOT be modified in-place).
-            region: (x, y, width, height) of the watermark region.
-
-        Returns:
-            Cleaned BGR image.
-        """
-        # Same channel normalization as remove_watermark: the reverse-alpha blend
-        # assumes 3-channel BGR (a grayscale/BGRA input would mis-broadcast).
-        result = image_io.to_bgr(image.copy())
-        x, y, rw, rh = region
-
-        # Check standard sizes
-        if rw == 48 and rh == 48:
-            self._reverse_alpha_blend(result, self._alpha_small, (x, y))
-            return result
-        if rw == 96 and rh == 96:
-            self._reverse_alpha_blend(result, self._alpha_large, (x, y))
-            return result
-
-        # Interpolate alpha map for custom size
-        interp = cv2.INTER_LINEAR if rw > 96 else cv2.INTER_AREA
-        alpha = cv2.resize(self._alpha_large, (rw, rh), interpolation=interp)
-        self._reverse_alpha_blend(result, alpha, (x, y))
-        return result
 
     def _footprint_indices(
         self,
@@ -712,7 +577,7 @@ class GeminiEngine:
         a_cap = float(alpha_roi.max())
         if a_cap < 0.2:
             return None
-        core = alpha_roi >= a_cap * self._ALPHA_GAIN_CORE_FRAC
+        core = alpha_roi >= a_cap * self._CORE_ALPHA_FRAC
         if not bool(core.any()):
             return None
         # Convert only the footprint+ring crop to gray, not the whole image: every
@@ -748,279 +613,6 @@ class GeminiEngine:
         """
         cb = self._core_and_bg(image, alpha_map, position)
         return None if cb is None else cb[0] - cb[1]
-
-    def _estimate_alpha_gain(
-        self,
-        image: NDArray[Any],
-        alpha_map: NDArray[Any],
-        position: tuple[int, int],
-    ) -> float:
-        """Scale factor matching the captured alpha to this image's sparkle opacity.
-
-        The captured alpha (peak ~0.51) under-represents sparkles rendered more
-        opaque; reverse-alpha then leaves a bright residual. Estimate the effective
-        opacity at the sparkle core (observed brightness vs the local background
-        ring) and return ``a_eff / a_capture``, clamped to ``[1.0, _ALPHA_GAIN_MAX]``
-        so it only ever STRENGTHENS removal (1.0 = no change on a matching sparkle).
-        Returns 1.0 when the background cannot be estimated reliably.
-        """
-        cb = self._core_and_bg(image, alpha_map, position)
-        if cb is None:
-            return 1.0
-        core_obs, bg, a_cap = cb
-        if 255.0 - bg < 5.0:
-            return 1.0
-        a_eff = float(np.clip((core_obs - bg) / (255.0 - bg), 0.0, 0.99))
-        return float(np.clip(a_eff / a_cap, 1.0, self._ALPHA_GAIN_MAX))
-
-    def _reverse_alpha_oversubtracts(
-        self,
-        image: NDArray[Any],
-        alpha_map: NDArray[Any],
-        position: tuple[int, int],
-    ) -> bool:
-        """True when reverse-alpha would drive the footprint dark.
-
-        Two signatures of the captured alpha over-estimating this image's sparkle
-        opacity, either of which means reverse-alpha would leave a dark mark:
-
-        1. Dark-background black pit (issue #30): the numerator
-           ``watermarked - alpha*logo`` over the sparkle body. A brightening overlay
-           can never make it negative, so a large negative fraction means the fixed
-           alpha over-subtracts past black.
-        2. Mid-tone dark diamond (see ``_OVERSUB_DARK_MARGIN``): on a mid-tone
-           background the over-subtraction darkens the core well below the background
-           without any pixel crossing zero, so case 1 misses it. Predict the
-           reverse-alpha core output and trip when it lands far below the local ring.
-        """
-        placed = self._footprint_indices(alpha_map, position, image.shape)
-        if placed is None:
-            return False
-        alpha_roi, (y1, y2, x1, x2) = placed
-        body = alpha_roi >= self._FOOTPRINT_ALPHA
-        if not bool(body.any()):
-            return False
-        roi = image[y1:y2, x1:x2].astype(np.float32)
-        numerator = roi.mean(axis=2) - np.clip(alpha_roi, 0.0, 0.99) * self.logo_value
-        frac = float((numerator[body] < 0).sum()) / float(body.sum())
-        if frac > self._OVERSUB_FOOTPRINT_FRAC:
-            return True
-
-        # Mid-tone darkening: predict the reverse-alpha output at the bright core and
-        # compare to the local background ring (reuses the FP-gate / alpha-gain machinery).
-        cb = self._core_and_bg(image, alpha_map, position)
-        if cb is None:
-            return False
-        core_obs, bg, a_cap = cb
-        a = min(a_cap, 0.99)
-        predicted_core = (core_obs - a * self.logo_value) / (1.0 - a)
-        return predicted_core < bg - self._OVERSUB_DARK_MARGIN
-
-    def _inpaint_footprint(
-        self,
-        image: NDArray[Any],
-        alpha_map: NDArray[Any],
-        position: tuple[int, int],
-    ) -> None:
-        """Inpaint the sparkle body from surrounding pixels, in-place.
-
-        Fallback for backgrounds where reverse-alpha over-subtracts: a small mask of
-        the footprint (alpha >= threshold, dilated) is reconstructed by cv2 NS inpaint
-        from the continuous surroundings, so the sparkle is replaced by plausible
-        background instead of a black pit.
-        """
-        placed = self._footprint_indices(alpha_map, position, image.shape)
-        if placed is None:
-            return
-        alpha_roi, (y1, y2, x1, x2) = placed
-        # Inpaint only a padded crop around the footprint, not the whole image: the
-        # mask is zero outside a ~96x96 corner, so inpainting the full (multi-MP)
-        # image would be ~hundreds of times more work for an identical result. The
-        # padding gives cv2 enough surrounding context to reconstruct the sparkle.
-        ih, iw = image.shape[:2]
-        pad = 24
-        cy1, cy2 = max(0, y1 - pad), min(ih, y2 + pad)
-        cx1, cx2 = max(0, x1 - pad), min(iw, x2 + pad)
-        crop = image[cy1:cy2, cx1:cx2]
-        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
-        mask[y1 - cy1 : y2 - cy1, x1 - cx1 : x2 - cx1] = (alpha_roi >= self._FOOTPRINT_ALPHA).astype(np.uint8) * 255
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.dilate(mask, kernel, iterations=2)
-        image[cy1:cy2, cx1:cx2] = cv2.inpaint(crop, mask, 6, cv2.INPAINT_NS)
-
-    def _verify_and_repair(
-        self,
-        result: NDArray[Any],
-        alpha_map: NDArray[Any],
-        position: tuple[int, int],
-        size: WatermarkSize,
-    ) -> NDArray[Any]:
-        """Inpaint-repair a sparkle that survived reverse-alpha, keeping the better.
-
-        Re-detect on the reverse-alpha output; if a sparkle this strong remains (an
-        alpha mismatch the gain estimate could not fully correct), inpaint the
-        footprint and return that ONLY when it lowers the re-detect confidence. The
-        footprint inpaint reconstructs from the (darker) surroundings, so it physically
-        removes the bright sparkle rather than gaming the shape-NCC. Returns ``result``
-        unchanged when the removal is already clean (the common case) or when the
-        inpaint does not improve it, so it can never regress.
-        """
-        residual = self.detect_watermark(result, force_size=size).confidence
-        if residual < self._VERIFY_FALLBACK_CONF:
-            return result
-        candidate = result.copy()
-        self._inpaint_footprint(candidate, alpha_map, position)
-        if self.detect_watermark(candidate, force_size=size).confidence < residual:
-            logger.debug("Sparkle survived reverse-alpha (conf=%.3f); footprint inpaint improved it.", residual)
-            return candidate
-        return result
-
-    def _reverse_alpha_blend(
-        self,
-        image: NDArray[Any],
-        alpha_map: NDArray[Any],
-        position: tuple[int, int],
-    ) -> None:
-        """Apply reverse alpha blending in-place.
-
-        Formula: original = (watermarked - a * logo) / (1 - a)
-        """
-        placed = self._footprint_indices(alpha_map, position, image.shape)
-        if placed is None:
-            return
-        alpha_roi, (y1, y2, x1, x2) = placed
-        image_roi = image[y1:y2, x1:x2].astype(np.float32)
-
-        alpha_threshold = 0.002
-        max_alpha = 0.99
-
-        # Vectorized reverse alpha blending
-        alpha = alpha_roi.copy()
-        mask = alpha >= alpha_threshold
-        alpha = np.clip(alpha, 0.0, max_alpha)
-        one_minus_alpha = 1.0 - alpha
-
-        # Expand alpha for 3-channel broadcast
-        alpha_3d = alpha[:, :, np.newaxis]
-        one_minus_3d = one_minus_alpha[:, :, np.newaxis]
-        mask_3d = mask[:, :, np.newaxis]
-
-        # original = (watermarked - alpha * logo) / (1 - alpha)
-        restored = (image_roi - alpha_3d * self.logo_value) / one_minus_3d
-        restored = np.clip(restored, 0.0, 255.0)
-
-        # Apply only where alpha is significant
-        image_roi = np.where(mask_3d, restored, image_roi)
-        image[y1:y2, x1:x2] = image_roi.astype(np.uint8)
-
-    # ── Inpainting cleanup ───────────────────────────────────────────
-
-    def inpaint_residual(
-        self,
-        image: NDArray[Any],
-        region: tuple[int, int, int, int],
-        strength: float = 0.85,
-        method: Literal["gaussian", "telea", "ns"] = "ns",
-        inpaint_radius: int = 10,
-        padding: int = 32,
-    ) -> NDArray[Any]:
-        """Apply inpaint cleanup on residual artifacts after reverse alpha blend.
-
-        Uses a sparse mask derived from alpha map gradient to repair only
-        the sparkle-edge pixels where interpolation broke the math.
-
-        Args:
-            image: BGR image (will NOT be modified in-place).
-            region: (x, y, w, h) of the watermark region.
-            strength: Blend strength (0.0 = keep original, 1.0 = fully inpainted).
-            method: Inpaint method ("gaussian", "telea", or "ns").
-            inpaint_radius: Radius for cv2.inpaint.
-            padding: Context padding around region in pixels.
-
-        Returns:
-            Cleaned BGR image.
-        """
-        result = image.copy()
-        x, y, rw, rh = region
-
-        if rw < 4 or rh < 4:
-            return result
-
-        strength = max(0.0, min(1.0, strength))
-        if strength < 0.001:
-            return result
-
-        # Padded region
-        px1 = max(0, x - padding)
-        py1 = max(0, y - padding)
-        px2 = min(image.shape[1], x + rw + padding)
-        py2 = min(image.shape[0], y + rh + padding)
-
-        if (px2 - px1) < 8 or (py2 - py1) < 8:
-            return result
-
-        # Inner rect relative to padded
-        ix1 = x - px1
-        iy1 = y - py1
-
-        # Get alpha map (interpolated if needed)
-        source_alpha = self._alpha_large
-        interp = cv2.INTER_LINEAR if rw > source_alpha.shape[1] else cv2.INTER_AREA
-        alpha_resized = cv2.resize(source_alpha, (rw, rh), interpolation=interp)
-
-        # Compute gradient mask from alpha
-        grad_x = cv2.Sobel(alpha_resized, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(alpha_resized, cv2.CV_32F, 0, 1, ksize=3)
-        grad_mag = cv2.magnitude(grad_x, grad_y)
-
-        grad_min, grad_max = grad_mag.min(), grad_mag.max()
-        if grad_max <= grad_min:
-            return result
-
-        # Normalize and apply gamma correction
-        grad_norm = (grad_mag - grad_min) / (grad_max - grad_min)
-        grad_weight = np.sqrt(grad_norm)
-
-        # Dilate the mask
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        grad_weight = cv2.dilate(grad_weight, kernel)
-
-        if method == "gaussian":
-            # Soft blend with Gaussian blur
-            padded_roi = result[py1:py2, px1:px2].copy()
-            blurred = cv2.GaussianBlur(padded_roi, (0, 0), sigmaX=2.0)
-
-            # Create weight mask on padded area (only inner region has weights)
-            weight_full = np.zeros((py2 - py1, px2 - px1), dtype=np.float32)
-            weight_full[iy1 : iy1 + rh, ix1 : ix1 + rw] = grad_weight * strength
-
-            weight_3d = weight_full[:, :, np.newaxis]
-            blended = padded_roi.astype(np.float32) * (1 - weight_3d) + blurred.astype(np.float32) * weight_3d
-            result[py1:py2, px1:px2] = blended.astype(np.uint8)
-        else:
-            # OpenCV inpainting (TELEA or NS)
-            inpaint_flag = cv2.INPAINT_TELEA if method == "telea" else cv2.INPAINT_NS
-
-            # Create binary mask from gradient weight
-            binary_mask = (grad_weight * 255).astype(np.uint8)
-            _, binary_mask = cv2.threshold(binary_mask, 30, 255, cv2.THRESH_BINARY)
-
-            # Expand mask to padded region
-            mask_full = np.zeros((py2 - py1, px2 - px1), dtype=np.uint8)
-            mask_full[iy1 : iy1 + rh, ix1 : ix1 + rw] = binary_mask
-
-            padded_roi = result[py1:py2, px1:px2].copy()
-            inpainted = cv2.inpaint(padded_roi, mask_full, inpaint_radius, inpaint_flag)
-
-            # Blend with strength
-            weight_full = np.zeros((py2 - py1, px2 - px1), dtype=np.float32)
-            weight_full[iy1 : iy1 + rh, ix1 : ix1 + rw] = grad_weight * strength
-            weight_3d = weight_full[:, :, np.newaxis]
-
-            blended = padded_roi.astype(np.float32) * (1 - weight_3d) + inpainted.astype(np.float32) * weight_3d
-            result[py1:py2, px1:px2] = blended.astype(np.uint8)
-
-        return result
 
 
 def detect_sparkle_confidence(image_path: Path, *, image: NDArray[Any] | None = None) -> float | None:

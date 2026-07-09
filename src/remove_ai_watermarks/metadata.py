@@ -864,6 +864,69 @@ def _strip_with_ffmpeg(source_path: Path, output_path: Path) -> Path:
     return output_path
 
 
+def _jpeg_app_carries_ai(marker: int, payload: bytes) -> bool:
+    """Whether a JPEG APPn segment carries AI provenance to drop wholesale (C2PA in
+    APP11, an AI XMP packet in APP1, an IPTC "Made with AI" record in APP13). EXIF
+    (APP1 ``Exif``) is NOT dropped here -- it is scrubbed tag-by-tag via piexif so
+    genuine camera EXIF survives."""
+    if marker == 0xEB:  # APP11: C2PA / JUMBF manifest
+        return c2pa_marker_in(payload) or b"jumb" in payload[:256].lower()
+    if marker == 0xE1 and payload.startswith(b"http://ns.adobe.com/xap/"):  # APP1 XMP
+        return c2pa_marker_in(payload) or any(m in payload for m in AIGC_MARKERS)
+    if marker == 0xED:  # APP13: Photoshop / IPTC
+        return any(m in payload for m in IPTC_AI_MARKERS) or any(m in payload for m in IPTC_AI_FIELD_MARKERS)
+    return False
+
+
+def _strip_jpeg_metadata_lossless(source_path: Path, output_path: Path) -> bool:
+    """Remove AI metadata from a JPEG WITHOUT re-encoding the DCT scan, so the pixels
+    stay bit-identical (the point of "work with originals" -- a metadata strip must not
+    degrade the image). Walks the marker segments up to SOS, drops the AI-bearing APP
+    segments (:func:`_jpeg_app_carries_ai`), copies the entropy-coded scan verbatim,
+    then scrubs AI EXIF tags in place via piexif (which rewrites only the APP1 EXIF,
+    leaving genuine camera EXIF and the scan untouched). Returns False if the bytes are
+    not a parseable JPEG, so the caller falls back to the near-lossless PIL re-save."""
+    import piexif
+
+    data = source_path.read_bytes()
+    if not data.startswith(b"\xff\xd8"):
+        return False
+    out = bytearray(b"\xff\xd8")
+    i, n = 2, len(data)
+    while i + 1 < n:
+        if data[i] != 0xFF:
+            out += data[i:]  # malformed stream: copy the remainder verbatim
+            break
+        marker = data[i + 1]
+        if marker in (0xDA, 0xD9):  # SOS / EOI -> the coded scan follows; copy verbatim
+            out += data[i:]
+            break
+        if 0xD0 <= marker <= 0xD7 or marker == 0x01:  # standalone markers carry no length
+            out += data[i : i + 2]
+            i += 2
+            continue
+        if i + 4 > n:
+            out += data[i:]
+            break
+        seg_len = int.from_bytes(data[i + 2 : i + 4], "big")
+        seg_end = i + 2 + seg_len
+        if seg_len < 2 or seg_end > n:
+            out += data[i:]
+            break
+        if not _jpeg_app_carries_ai(marker, data[i + 4 : seg_end]):
+            out += data[i:seg_end]
+        i = seg_end
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(bytes(out))
+    try:
+        exif = piexif.load(str(output_path))
+        if _scrub_ai_exif(exif):
+            piexif.insert(piexif.dump(exif), str(output_path))
+    except Exception:
+        logger.debug("piexif EXIF scrub skipped on %s", output_path, exc_info=True)
+    return True
+
+
 def remove_ai_metadata(
     source_path: Path,
     output_path: Path | None = None,
@@ -930,6 +993,14 @@ def remove_ai_metadata(
     # ffmpeg (-c copy -- codec data untouched, only tags/chapters dropped).
     if source_path.suffix.lower() in _FFMPEG_STRIP_EXTS:
         return _strip_with_ffmpeg(source_path, output_path)
+
+    # JPEG: strip AI metadata at the byte level so the DCT scan (the pixels) is NOT
+    # re-encoded. The PIL open+save path below is lossy for JPEG (a q95 re-encode that
+    # would undo the quality-preserving writes of the removal pipelines); this keeps a
+    # JPEG bit-identical outside its APP metadata segments. Falls through on a
+    # non-parseable JPEG.
+    if output_path.suffix.lower() in (".jpg", ".jpeg") and _strip_jpeg_metadata_lossless(source_path, output_path):
+        return output_path
 
     # Read image and filter metadata
     with Image.open(source_path) as img:

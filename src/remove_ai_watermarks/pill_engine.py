@@ -1,9 +1,9 @@
 """Jimeng-basic 'AI生成' pill: a CAPTURE-LESS visible mark (issue #54).
 
 The Jimeng free-tier TC260 label is a rounded pill with 'AI生成' in the TOP-LEFT
-corner -- distinct from the reverse-alpha ``jimeng`` "★ 即梦AI" mark (bottom-right).
-No flat capture / alpha map exists for it, so it is removed by INPAINT, not
-reverse-alpha:
+corner -- distinct from the ``jimeng`` "★ 即梦AI" wordmark (bottom-right). It has no
+captured alpha map, so unlike the other marks it is detected purely by a synthetic
+silhouette; like every mark it is then removed by the shared localize -> fill:
 
   * Detect: edge-NCC of a font-rendered SILHOUETTE (``assets/jimeng_pill.png``,
     synthetic, data-safe -- see ``scripts/render_pill_silhouette.py``) against the
@@ -89,7 +89,7 @@ def _grad(gray: NDArray[Any]) -> NDArray[Any]:
 
 
 class PillEngine:
-    """Detect + inpaint-mask the top-left 'AI生成' pill (edge-NCC, no reverse-alpha)."""
+    """Detect + build the removal mask for the top-left 'AI生成' pill (edge-NCC of a synthetic silhouette)."""
 
     def _match(self, image: NDArray[Any]) -> tuple[float, tuple[int, int, int, int]] | None:
         sil = _load_silhouette()

@@ -256,8 +256,10 @@ class InvisibleEngine:
 
         # Always persist to a temp file, even without downscaling: WatermarkRemover
         # reloads by path, so the EXIF-transposed pixels must be saved or rotation
-        # is lost. Cleaned up in the finally block via _tmp_path.
-        _tmp_fd, _tmp_str = tempfile.mkstemp(suffix=image_path.suffix)
+        # is lost. Written as PNG (lossless) regardless of the input format, so a JPEG
+        # input does not feed a re-compressed copy into the diffusion pass.
+        # Cleaned up in the finally block via _tmp_path.
+        _tmp_fd, _tmp_str = tempfile.mkstemp(suffix=".png")
         _tmp_path = Path(_tmp_str)
         image.save(_tmp_path)
         os.close(_tmp_fd)

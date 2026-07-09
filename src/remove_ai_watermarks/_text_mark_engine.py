@@ -1,20 +1,22 @@
-"""Shared base for the reverse-alpha visible text-mark engines.
+"""Shared base for the visible text-mark detectors/localizers (localize -> fill).
 
 The Doubao "豆包AI生成", Jimeng "★ 即梦AI", and Samsung "✦ Contenuti generati
 dall'AI" marks are the SAME algorithm: anchor a bottom-corner box by width-relative
-geometry, extract the light low-saturation glyph candidate, detect by matching the
-bundled alpha-glyph silhouette via ``TM_CCOEFF_NORMED``, and remove by inverting the
-alpha blend ``original = (wm - a*logo)/(1-a)`` (always trying fixed AND NCC-aligned
-placement, keeping the lower-residual one) plus a thin footprint inpaint.
+geometry, extract the light low-saturation glyph candidate (white top-hat), detect
+by matching the bundled alpha-glyph silhouette via ``TM_CCOEFF_NORMED``, and build a
+removal MASK from the glyph blob's bounding box (:meth:`footprint_mask`) for the
+shared fill (region_eraser). The mask is template-FREE -- the top-hat glyph bbox, not
+a fixed alpha-template placement -- so a re-rendered or differently-placed mark (e.g.
+a non-Italian Samsung string) is still masked. The old reverse-alpha pixel recovery
+(``original = (wm - a*logo)/(1-a)``) is gone.
 
 They differ ONLY in a bounded set of tuned values captured by :class:`TextMarkConfig`:
-the constants, the bundled asset, the corner (Doubao/Jimeng bottom-right, Samsung
-bottom-left), and a few structural knobs (the morphology-open kernel size and the
-minimum glyph width used by the alignment / template-match). Each engine module is a
-thin :class:`TextMarkEngine` subclass plus the test-facing module constants/helpers.
+the constants, the bundled silhouette asset, the corner (Doubao/Jimeng bottom-right,
+Samsung bottom-left), and a few structural knobs. Each engine module is a thin
+:class:`TextMarkEngine` subclass plus the test-facing module constants/helpers.
 
-Gemini stays a SEPARATE engine (``gemini_engine``): its multi-size fixed-slot sparkle
-model is genuinely different, not a tuned variant of this one.
+Gemini stays a SEPARATE engine (``gemini_engine``): its multi-size sparkle model is
+genuinely different, not a tuned variant of this one.
 """
 
 # cv2/numpy boundary: third-party libs ship no usable element types; relax the
@@ -37,28 +39,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Reverse-alpha over-subtraction guard (ported from gemini_engine, 2026-06-20).
-# The reverse-alpha blend ``(wm - a*logo)/(1-a)`` over-subtracts when the captured
-# alpha over-estimates THIS image's mark opacity: on a dark or mid-tone background
-# it drives the glyph footprint into a visibly DARKER-than-background ghost (a
-# "dark pit") instead of recovering the true pixels. The retained-corpus mining
-# (2026-06-20) showed the sparkle-only fix (commit 41f6797) left this unhandled
-# for the Doubao/Jimeng text marks. Mirror the sparkle gate: when the recovered
-# glyph body lands more than this many gray levels below the local background
-# ring, abandon the reverse-alpha output for the footprint and inpaint it from
-# the surroundings instead. Calibrated to the same 25-level margin the sparkle
-# gate uses -- clean text-mark removals recover within ~10 of the ring, the dark
-# pit lands tens of levels below.
-_OVERSUB_DARK_MARGIN = 25.0
-# Glyph-body / background-ring sampling for the guard. The ring is a pad around
-# the glyph box (excluding the box); the body is the bright-core glyph pixels.
-_OVERSUB_RING_PAD_FRAC = 0.6  # ring pad as a fraction of the glyph-box height
-_OVERSUB_BODY_ALPHA_FLOOR = 0.15  # alpha above which a block pixel counts as glyph body
-# Footprint inpaint when the guard trips: dilate the glyph mask wider than the
-# thin residual pass so the whole darkened ghost is reconstructed, not just its edge.
-_OVERSUB_INPAINT_DILATE = 9
-_OVERSUB_INPAINT_RADIUS = 4
-
 # Minimum image short side (px) for text-mark DETECTION. Below this the glyph
 # template degrades to the ``min_gw`` floor (~8 px) and TM_CCOEFF_NORMED on a few
 # pixels is noise, so an unrelated small geometric shape can spuriously correlate
@@ -72,10 +52,17 @@ _OVERSUB_INPAINT_RADIUS = 4
 # positive; removal is gated on detection, so it is suppressed too.
 _MIN_DETECT_SHORT_SIDE = 200
 
+# Provenance-confirmed NCC relaxation. When external metadata already confirms the
+# vendor (so the mark is present with high prior), a faint or slightly re-rendered
+# glyph that scores just below the standard NCC gate is still trusted. 0.7 recovers
+# the near-threshold marks without dropping so low that an unrelated corner texture
+# on a (provenance-confirmed) image would match -- the coverage gate still applies.
+_PROVENANCE_NCC_FACTOR = 0.7
+
 
 @dataclass(frozen=True)
 class TextMarkConfig:
-    """All per-mark tuning for a reverse-alpha text-mark engine."""
+    """All per-mark tuning for a text-mark detector/localizer."""
 
     name: str  # short label for log lines (e.g. "Doubao")
     asset_name: str  # bundled alpha PNG under assets/ (e.g. "doubao_alpha.png")
@@ -94,18 +81,12 @@ class TextMarkConfig:
     # detection
     detect_min_coverage: float
     detect_ncc_threshold: float
-    # alpha-map geometry (fraction of WIDTH) emitted by scripts/visible_alpha_solve.py
+    # alpha-map glyph geometry (fraction of WIDTH) emitted by
+    # scripts/visible_alpha_solve.py, sizing the detection silhouette for
+    # template_match_score
     alpha_width_frac: float
     alpha_height_frac: float
-    alpha_margin_x_frac: float
-    alpha_margin_bottom_frac: float
-    alpha_align_search: tuple[float, float, int]  # np.linspace(start, stop, num) scale search
-    min_gw: int  # minimum glyph width for the template match / align search (8 br, 16 Samsung)
-    alpha_logo_bgr: tuple[float, float, float] = (255.0, 255.0, 255.0)
-    # residual inpaint over the glyph footprint (thin)
-    residual_alpha_floor: float = 0.05
-    residual_dilate: int = 5
-    residual_inpaint_radius: int = 2
+    min_gw: int  # minimum glyph width for the template match (8 br, 16 Samsung)
 
 
 @dataclass
@@ -184,7 +165,7 @@ def template_match_score(box_mask: NDArray[Any], image_width: int, config: TextM
 
 
 class TextMarkEngine:
-    """Reverse-alpha visible text-mark remover (locate -> mask -> detect -> reverse-alpha)."""
+    """Visible text-mark detector/localizer (locate -> mask -> detect; mask feeds the fill)."""
 
     def __init__(self, config: TextMarkConfig) -> None:
         self.config = config
@@ -262,9 +243,16 @@ class TextMarkEngine:
 
     # ── Detect ──────────────────────────────────────────────────────────
 
-    def detect(self, image: NDArray[Any]) -> TextMarkDetection:
+    def detect(self, image: NDArray[Any], *, provenance: bool = False) -> TextMarkDetection:
         """Detect the mark by matching the alpha-template glyph silhouette against
-        the corner candidate (``TM_CCOEFF_NORMED``); keys on glyph SHAPE, not coverage."""
+        the corner candidate (``TM_CCOEFF_NORMED``); keys on glyph SHAPE, not coverage.
+
+        ``provenance`` signals that external metadata already confirms this vendor
+        (China-AIGC / byteimg for Doubao/Jimeng, ``samsung_genai`` for Samsung); the
+        NCC gate exists to keep a corner texture on an UNRELATED image from matching
+        the glyph silhouette, so when provenance confirms the vendor it is relaxed by
+        ``_PROVENANCE_NCC_FACTOR`` to recover a faint or slightly re-rendered mark.
+        """
         c = self.config
         det = TextMarkDetection()
         if image is None or image.size == 0:
@@ -288,260 +276,69 @@ class TextMarkEngine:
         det.coverage = coverage
         if coverage >= c.detect_min_coverage:
             score = self._template_match_score(box, image.shape[1])
+            threshold = c.detect_ncc_threshold * (_PROVENANCE_NCC_FACTOR if provenance else 1.0)
             det.confidence = score
-            det.detected = score >= c.detect_ncc_threshold
-            logger.debug("%s detect: coverage=%.3f ncc=%.2f detected=%s", c.name, coverage, score, det.detected)
+            det.detected = score >= threshold
+            logger.debug(
+                "%s detect: coverage=%.3f ncc=%.2f thr=%.2f detected=%s",
+                c.name,
+                coverage,
+                score,
+                threshold,
+                det.detected,
+            )
         return det
 
-    # ── Reverse-alpha (recovery + thin residual inpaint) ────────────────
-
-    def reverse_alpha_available(self, image: NDArray[Any]) -> bool:
-        """True if the bundled alpha map is loadable (NCC alignment places it at any
-        resolution; the caller still gates on ``detect`` so a clean corner is untouched)."""
-        return image is not None and image.size > 0 and self._alpha_template() is not None
-
-    def _fixed_alpha_map(self, image: NDArray[Any]) -> tuple[NDArray[Any], tuple[int, int, int, int]] | None:
-        """Place the template by fixed width-relative geometry (pixel-exact at the
-        captured width).
-
-        Returns the glyph-sized alpha BLOCK (shape ``(gh, gw)``) plus its placement
-        ``(ax, ay, gw, gh)``, not a full-frame ``(h, w)`` map. The map is non-zero
-        only inside the glyph box and every consumer reads exactly that box, so a
-        full-frame float32 map was O(image*4 bytes) of mostly zeros -- ~48 MB on a
-        12 MP frame, and two were held at once (fixed + aligned). The block is
-        byte-identical to the old full-frame map's ``[ay:ay+gh, ax:ax+gw]`` slice.
-        """
-        c = self.config
-        at = self._alpha_template()
-        if at is None:
-            return None
-        h, w = image.shape[:2]
-        # Clamp both dims so a wide/short image cannot overflow the slice assignment.
-        gw = min(w, max(1, int(c.alpha_width_frac * w)))
-        gh = min(h, max(1, int(c.alpha_height_frac * w)))
-        if c.corner == "br":
-            ax = max(0, w - int(c.alpha_margin_x_frac * w) - gw)
-        else:  # bottom-left
-            ax = min(max(0, int(c.alpha_margin_x_frac * w)), max(0, w - gw))
-        ay = max(0, h - int(c.alpha_margin_bottom_frac * w) - gh)
-        block = cv2.resize(at, (gw, gh), interpolation=cv2.INTER_LINEAR)
-        return block, (ax, ay, gw, gh)
-
-    def _aligned_alpha_map(self, image: NDArray[Any]) -> tuple[NDArray[Any], tuple[int, int, int, int]] | None:
-        """Register the captured template to the actual mark via a TM_CCOEFF_NORMED
-        scale + position search. Returns the glyph-sized alpha BLOCK and its
-        placement ``(ax, ay, gw, gh)`` (see :meth:`_fixed_alpha_map` for why the
-        block, not a full-frame map), or None."""
-        c = self.config
-        at = self._alpha_template()
-        sil = self._glyph_silhouette()
-        if at is None or sil is None:
-            return None
-        w = image.shape[1]
-        loc = self.locate(image)
-        bx, by, bw, bh = loc.bbox
-        box_mask = self.extract_mask(image, loc)  # box-sized (== old full-frame cropped to bbox)
-        expected = c.alpha_width_frac * w
-        best: tuple[float, int, int, int, int] | None = None
-        for scale in np.linspace(*c.alpha_align_search):
-            gw, gh = int(expected * scale), int(c.alpha_height_frac * w * scale)
-            if gw < c.min_gw or gh < 4 or gw >= bw or gh >= bh:
-                continue
-            t = cv2.resize(sil, (gw, gh), interpolation=cv2.INTER_NEAREST)
-            _, score, _, top_left = cv2.minMaxLoc(cv2.matchTemplate(box_mask, t, cv2.TM_CCOEFF_NORMED))
-            if best is None or score > best[0]:
-                best = (score, gw, gh, top_left[0], top_left[1])
-        if best is None:
-            return None
-        _, gw, gh, ox, oy = best
-        ax, ay = bx + ox, by + oy
-        block = cv2.resize(at, (gw, gh), interpolation=cv2.INTER_LINEAR)
-        return block, (ax, ay, gw, gh)
-
-    def _apply_reverse_alpha(
-        self, image: NDArray[Any], amap: NDArray[Any], region: tuple[int, int, int, int]
-    ) -> NDArray[Any]:
-        """Invert the alpha blend with ``amap``: ``original = (wm - a*logo)/(1-a)``.
-
-        ``amap`` is the glyph-sized alpha BLOCK for ``region`` (x, y, w, h); outside
-        it the blend is a no-op (``(wm - 0)/(1 - 0) == wm``). Compute the math on the
-        glyph crop only and copy the rest through unchanged -- byte-identical to a
-        full-frame pass (a uint8 round-trip through float32 is exact), but O(glyph)
-        instead of O(image): a full-frame pass costs ~275 ms on a 12 MP frame for a
-        glyph that is <0.1% of it, and it runs once per candidate placement.
-        """
-        out = image.copy()
-        x1, y1, gw, gh = region
-        x2, y2 = x1 + gw, y1 + gh
-        if y1 >= y2 or x1 >= x2:
-            return out
-        a3 = np.clip(amap, 0.0, 1.0)[:, :, None]
-        logo = np.array(self.config.alpha_logo_bgr, np.float32)
-        roi = out[y1:y2, x1:x2].astype(np.float32)
-        out[y1:y2, x1:x2] = np.clip((roi - a3 * logo) / np.clip(1.0 - a3, 0.25, 1.0), 0, 255).astype(np.uint8)
-        return out
-
-    def _reverse_alpha_oversubtracts(
-        self, image: NDArray[Any], amap: NDArray[Any], region: tuple[int, int, int, int]
-    ) -> bool:
-        """True when reverse-alpha would darken the glyph footprint into a dark pit.
-
-        Ported from ``gemini_engine._reverse_alpha_oversubtracts`` (2026-06-20):
-        PREDICT the reverse-alpha output at the bright glyph core directly from the
-        INPUT and the captured alpha, ``(core_obs - a*logo)/(1-a)``, and trip when it
-        lands more than ``_OVERSUB_DARK_MARGIN`` gray levels below the local
-        background ring. Predicting from the input (not the produced output) keeps the
-        gate independent of which placement the reverse-alpha picked, so a clean
-        full-strength mark (whose strokes predict back to the background) never trips,
-        while a mark fainter than the capture (over-subtracted into a ghost) does.
-        """
-        ax, ay, gw, gh = region
-        ih, iw = image.shape[:2]
-        if gw < 4 or gh < 4:
-            return False
-        if float(amap.max()) < 0.2:  # too faint a capture to over-subtract meaningfully
-            return False
-        body_box = amap >= _OVERSUB_BODY_ALPHA_FLOOR  # glyph strokes
-        if not bool(body_box.any()):
-            return False
-        pad = max(4, int(gh * _OVERSUB_RING_PAD_FRAC))
-        ry1, ry2 = max(0, ay - pad), min(ih, ay + gh + pad)
-        rx1, rx2 = max(0, ax - pad), min(iw, ax + gw + pad)
-        ring = image[ry1:ry2, rx1:rx2].astype(np.float32).mean(axis=2)
-        fy1, fy2, fx1, fx2 = ay - ry1, ay - ry1 + gh, ax - rx1, ax - rx1 + gw
-        ring_mask = np.ones(ring.shape, dtype=bool)
-        ring_mask[fy1:fy2, fx1:fx2] = False
-        if int(ring_mask.sum()) < 10:
-            return False
-        # Predict the reverse-alpha output PER PIXEL over the glyph body -- exactly
-        # the (obs - a*logo)/(1-a) math the remover applies -- so a cleanly captured
-        # mark predicts back to the true background everywhere (no trip), while a mark
-        # fainter than the capture predicts a body far below the local ring. The
-        # per-pixel alpha (not a single peak value) keeps the prediction faithful
-        # across the glyph's anti-aliased alpha gradient.
-        obs = ring[fy1:fy2, fx1:fx2]
-        a = np.clip(amap, 0.0, 0.99)
-        logo = float(np.mean(self.config.alpha_logo_bgr))
-        predicted = (obs - a * logo) / (1.0 - a)
-        predicted_core = float(np.median(predicted[body_box]))
-        bg = float(np.median(ring[ring_mask]))
-        oversub = predicted_core < bg - _OVERSUB_DARK_MARGIN
-        if oversub:
-            logger.debug(
-                "%s reverse-alpha over-subtracts: predicted core=%.1f bg=%.1f (margin %.0f) -> footprint inpaint",
-                self.config.name,
-                predicted_core,
-                bg,
-                _OVERSUB_DARK_MARGIN,
-            )
-        return oversub
-
-    def _inpaint_footprint(
-        self, image: NDArray[Any], amap: NDArray[Any], region: tuple[int, int, int, int]
-    ) -> NDArray[Any]:
-        """Reconstruct the glyph footprint from its surroundings (used when
-        reverse-alpha would over-subtract into a dark pit). Inpaints the ORIGINAL
-        image over a dilated glyph mask, so the result never contains the darkened
-        reverse-alpha pixels."""
-        ax, ay, gw, gh = region
-        mask = np.zeros(image.shape[:2], np.uint8)
-        mask[ay : ay + gh, ax : ax + gw] = (amap > self.config.residual_alpha_floor).astype(np.uint8) * 255
-        mask = cv2.dilate(mask, np.ones((_OVERSUB_INPAINT_DILATE, _OVERSUB_INPAINT_DILATE), np.uint8))
-        return cv2.inpaint(image, mask, _OVERSUB_INPAINT_RADIUS, cv2.INPAINT_NS)
-
-    def remove_watermark_reverse_alpha(self, image: NDArray[Any], *, residual_inpaint: bool = True) -> NDArray[Any]:
-        """Recover the original pixels by inverting the alpha blend, then clear the
-        residual outline with a thin inpaint over the glyph footprint.
-
-        Placement: fixed geometry AND the NCC-aligned placement are always tried and
-        the one leaving the least residual mark (lowest re-``detect`` confidence) is
-        kept -- the mark re-rasterizes a few px per image, so fixed geometry alone is
-        not reliable. A single capture cannot pixel-cancel the mark on every image, so
-        a deliberately THIN residual inpaint (``residual_*``) follows: reverse-alpha
-        has already recovered the true background under the mark, so the inpaint only
-        finishes the residual edges instead of smearing the whole footprint. Call only
-        when :meth:`reverse_alpha_available` and the mark is detected.
-        """
-        c = self.config
-        # Normalize to 3-channel BGR (the reverse-alpha math assumes a 3-channel logo).
-        image = image_io.to_bgr(image)
-        # An image too small to hold the mark would make the geometry boxes degenerate
-        # and feed cv2.resize a ~1-px-tall target; skip cv2 entirely.
-        h, w = image.shape[:2]
-        if h < 32 or w < 64:
-            return image.copy()
-        maps = [m for m in (self._fixed_alpha_map(image), self._aligned_alpha_map(image)) if m is not None]
-        if not maps:
-            return image.copy()
-        best_out: NDArray[Any] | None = None
-        best_amap: NDArray[Any] | None = None
-        best_region: tuple[int, int, int, int] | None = None
-        best_residual = float("inf")
-        for amap, region in maps:
-            out = self._apply_reverse_alpha(image, amap, region)
-            residual = self.detect(out).confidence
-            if residual < best_residual:
-                best_residual, best_out, best_amap, best_region = residual, out, amap, region
-        if best_out is None or best_amap is None or best_region is None:  # pragma: no cover - maps is non-empty
-            return image.copy()
-        # Over-subtraction guard: on a dark/mid-tone background the captured alpha can
-        # over-estimate the mark's opacity and reverse-alpha leaves a darker-than-
-        # background ghost. When the recovered glyph body sits far below the local
-        # ring, reconstruct the footprint from its surroundings instead of shipping the
-        # dark pit (the thin residual inpaint cannot fix a footprint-wide darkening).
-        if self._reverse_alpha_oversubtracts(image, best_amap, best_region):
-            return self._inpaint_footprint(image, best_amap, best_region)
-        if residual_inpaint:
-            # Embed the glyph-sized alpha block into a full-frame uint8 mask only for
-            # the inpaint (cv2.inpaint needs a mask matching best_out). One uint8
-            # full-frame array, built once, vs the old two full-frame float32 maps;
-            # byte-identical to thresholding the old full-frame float32 map (zero
-            # outside the block, so the dilate/inpaint see the same mask).
-            ax, ay, gw, gh = best_region
-            rm = np.zeros(best_out.shape[:2], np.uint8)
-            rm[ay : ay + gh, ax : ax + gw] = (best_amap > c.residual_alpha_floor).astype(np.uint8) * 255
-            kernel = np.ones((c.residual_dilate, c.residual_dilate), np.uint8)
-            rm = cv2.dilate(rm, kernel)
-            best_out = cv2.inpaint(best_out, rm, c.residual_inpaint_radius, cv2.INPAINT_NS)
-        return best_out
-
     # ── Inpaint footprint (for the inpaint-fallback removal path) ────────
+
+    # Minimum glyph pixels for a template-free footprint. Below this the corner has
+    # no real wordmark (a few top-hat specks), so without ``force`` there is nothing
+    # to mask. A real strip covers hundreds of pixels.
+    _MIN_GLYPH_PIXELS = 20
 
     def footprint_mask(
         self, image: NDArray[Any], *, force: bool = False, dilate: int | None = None
     ) -> NDArray[Any] | None:
-        """Full-frame uint8 mask (255 = mark) of the mark footprint, for the
-        inpaint-fallback removal path (LaMa / cv2), or None if no placement fits.
+        """Full-frame uint8 mask (255 = mark) of the mark footprint, for the shared
+        fill removal path (cv2 / MI-GAN / LaMa), or None if no glyph is found.
 
-        ``force`` is accepted for a uniform engine signature (the caller passes it to
-        every engine) but ignored here -- the text-mark footprint is always the
-        geometry-placed captured silhouette, present with or without a detection.
+        Template-FREE: localize the glyph blob with the top-hat :meth:`extract_mask`,
+        take its bounding box in the corner, and fill that box solid (plus a small
+        margin + dilation). Filling the enclosing rectangle -- not the sparse glyph
+        strokes -- is what makes it robust: the top-hat under-segments individual
+        strokes (which used to leave a "三包"-style residual ghost when the strokes
+        themselves were the mask), but the inpaint reconstructs the whole wordmark
+        rectangle from its surroundings, so a stroke missed by the top-hat is still
+        covered. This drops the fixed alpha-template dependency, so a re-rendered or
+        differently-localized mark (e.g. a non-Italian Samsung string) is still masked.
 
-        Uses the NCC-ALIGNED captured silhouette, NOT the per-image
-        :meth:`extract_mask` signature: the signature under-segments the glyphs, so
-        inpainting it leaves a residual ghost (corpus-validated 2026-07 -- Doubao
-        left a "三包" remnant). The mask is dilated to absorb alpha-alignment slop
-        (a scale/position mismatch at low detect confidence otherwise leaves a thin
-        residual ring); ``dilate`` defaults to a mark-relative margin.
-
-        The caller gates on detection -- this returns the geometric footprint
-        regardless, so a clean corner would be masked too.
+        With ``force`` and no glyph found, falls back to the whole geometry box (the
+        ``--no-detect`` path). The caller gates on detection.
         """
         image = image_io.to_bgr(image)
         h, w = image.shape[:2]
         if h < 32 or w < 64:
             return None
-        placed = self._aligned_alpha_map(image) or self._fixed_alpha_map(image)
-        if placed is None:
+        loc = self.locate(image)
+        bx, by, bw, bh = loc.bbox
+        glyph = self.extract_mask(image, loc)  # box-sized, 255 = glyph
+        ys, xs = np.where(glyph > 0)
+        if xs.size >= self._MIN_GLYPH_PIXELS:
+            pad = max(4, int(0.10 * bh))
+            rx1 = max(0, bx + int(xs.min()) - pad)
+            rx2 = min(w, bx + int(xs.max()) + 1 + pad)
+            ry1 = max(0, by + int(ys.min()) - pad)
+            ry2 = min(h, by + int(ys.max()) + 1 + pad)
+        elif force:
+            rx1, ry1, rx2, ry2 = bx, by, min(w, bx + bw), min(h, by + bh)
+        else:
             return None
-        block, (ax, ay, gw, gh) = placed
-        sil = (block > self.config.residual_alpha_floor).astype(np.uint8) * 255
-        if int((sil > 0).sum()) == 0:
+        if rx1 >= rx2 or ry1 >= ry2:
             return None
-        mask = np.zeros((h, w), np.uint8)
-        ch, cw = min(gh, h - ay), min(gw, w - ax)
-        mask[ay : ay + ch, ax : ax + cw] = sil[:ch, :cw]
-        d = dilate if dilate is not None else max(9, int(0.05 * gw))
-        if d > 0:
-            mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1)))
-        return mask
+        # Rectangular footprint + dilation is exactly region_eraser.boxes_to_mask (the
+        # same primitive the shared fill uses); reuse it instead of re-inlining the
+        # zeros/fill/MORPH_ELLIPSE-dilate here.
+        from remove_ai_watermarks import region_eraser
+
+        d = dilate if dilate is not None else max(3, int(0.02 * bw))
+        return region_eraser.boxes_to_mask((h, w), [(rx1, ry1, rx2 - rx1, ry2 - ry1)], dilate=d)

@@ -1,4 +1,5 @@
-"""Tests for vendored noai submodules: constants, extractor, cleaner, c2pa."""
+"""Tests for vendored noai submodules: constants, extractor, c2pa, plus the
+consolidated metadata strip (formerly noai.cleaner)."""
 
 from __future__ import annotations
 
@@ -7,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from remove_ai_watermarks.metadata import (
+    remove_ai_metadata as noai_remove_ai_metadata,
+)
 from remove_ai_watermarks.noai.c2pa import (
     _parse_c2pa_chunk,
     cbor_text_after,
@@ -15,12 +19,6 @@ from remove_ai_watermarks.noai.c2pa import (
     has_c2pa_metadata,
     inject_c2pa_chunk,
     synthid_verdict,
-)
-from remove_ai_watermarks.noai.cleaner import (
-    has_ai_content,
-)
-from remove_ai_watermarks.noai.cleaner import (
-    remove_ai_metadata as noai_remove_ai_metadata,
 )
 from remove_ai_watermarks.noai.constants import (
     AI_KEYWORDS,
@@ -52,6 +50,15 @@ class TestConstants:
 
     def test_supported_formats_include_jpg(self):
         assert ".jpg" in SUPPORTED_FORMATS
+
+    def test_supported_formats_include_heic_avif(self):
+        # HEIC/AVIF are first-class on the pixel path now (read+write via pillow-heif),
+        # so batch discovers them and the CLI does not warn.
+        assert {".heic", ".heif", ".avif"} <= SUPPORTED_FORMATS
+
+    def test_supported_formats_exclude_jpeg_xl(self):
+        # JPEG-XL stays metadata/strip-only -- no pixel decoder without pillow-jxl.
+        assert ".jxl" not in SUPPORTED_FORMATS
 
     def test_ai_metadata_keys_not_empty(self):
         assert len(AI_METADATA_KEYS) > 0
@@ -107,7 +114,8 @@ class TestExtractor:
 
 
 class TestCleaner:
-    """Tests for noai.cleaner functions."""
+    """Metadata stripping via the single, consolidated ``metadata.remove_ai_metadata``
+    (the legacy ``noai.cleaner`` duplicate was retired)."""
 
     def test_remove_ai_metadata(self, tmp_png_with_ai_metadata, tmp_path):
         output = tmp_path / "cleaned.png"
@@ -118,7 +126,7 @@ class TestCleaner:
         assert "parameters" not in meta
 
     def test_has_ai_content(self, tmp_png_with_ai_metadata):
-        assert has_ai_content(tmp_png_with_ai_metadata)
+        assert has_ai_metadata(tmp_png_with_ai_metadata)
 
 
 # ── C2PA ────────────────────────────────────────────────────────────

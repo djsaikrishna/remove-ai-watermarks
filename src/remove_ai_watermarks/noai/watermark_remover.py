@@ -738,12 +738,24 @@ class WatermarkRemover:
             self._set_progress(f"Encoding as JPEG → {output_path.name}...")
         else:
             self._set_progress(f"Encoding as PNG → {output_path.name}...")
-        cleaned_image.save(output_path)
+        # Encode through image_io so the regenerated image gets the same quality-
+        # preserving write as the visible path (JPEG q100 / 4:4:4, HEIC/AVIF via Pillow)
+        # instead of PIL's default JPEG quality 75, which would crush the diffusion
+        # output further for no reason.
+        import numpy as np
+
+        from remove_ai_watermarks import image_io
+
+        rgb = np.asarray(cleaned_image.convert("RGB"))[:, :, ::-1]  # PIL RGB -> cv2 BGR
+        if not image_io.imwrite(str(output_path), np.ascontiguousarray(rgb)):
+            cleaned_image.save(output_path)  # fallback for a container image_io/cv2 cannot encode
 
         if output_path.exists():
             self._set_progress("Stripping AI metadata from output...")
             try:
-                from remove_ai_watermarks.noai.cleaner import remove_ai_metadata
+                # The single, robust stripper (byte-level: lossless for JPEG, handles
+                # every container) -- not the legacy PIL-re-encoding noai.cleaner one.
+                from remove_ai_watermarks.metadata import remove_ai_metadata
 
                 remove_ai_metadata(output_path, output_path, keep_standard=True)
             except Exception:

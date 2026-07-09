@@ -493,7 +493,7 @@ _DEMO_AFTER = REPO_ROOT / "demo_banana_after.png"
 
 @pytest.mark.skipif(not (_DEMO_BEFORE.exists() and _DEMO_AFTER.exists()), reason="demo banana pair not present")
 class TestSparkleDetectRemoveAlignment:
-    """Detect (identify) and remove (registry.best_auto_mark) must agree on the
+    """Detect (identify) and remove (registry.detect_marks) must agree on the
     same image -- the retained-corpus desync where identify reported a sparkle the
     removal arbitration declined (or vice versa). Both gate on the single shared
     GEMINI_SPARKLE_TRUST_CONF, so a sparkle just over the line is taken by BOTH
@@ -520,8 +520,8 @@ class TestSparkleDetectRemoveAlignment:
 
         conf = detect_sparkle_confidence(path) or 0.0
         identify_fires = conf >= GEMINI_SPARKLE_TRUST_CONF
-        best = watermark_registry.best_auto_mark(image_io.imread(path))
-        remove_takes_gemini = best is not None and best.key == "gemini"
+        dets = watermark_registry.detect_marks(image_io.imread(path), include_explicit=False)
+        remove_takes_gemini = any(d.key == "gemini" and d.detected for d in dets)
         return identify_fires, remove_takes_gemini, conf
 
     def test_above_threshold_both_fire(self, tmp_path: Path):

@@ -27,7 +27,7 @@ It does **not** target watermarks that protect someone else's paid or copyrighte
 
 ## Features
 
-- **Visible watermark removal** — a registry of known marks in their usual places: the Gemini / Nano Banana sparkle, the Doubao "豆包AI生成" text strip, the Jimeng "★ 即梦AI" wordmark, and the Samsung Galaxy AI "✦ Contenuti generati dall'AI" strip (bottom-left, locale-specific). Each is removed by **reverse-alpha blending** against a captured alpha map (`original = (wm − α·logo)/(1−α)`), recovering the true pixels rather than inpainting a guess. The Gemini sparkle recovers cleanly on its own on bright backgrounds; it adapts the alpha to each image's sparkle opacity, so a more-opaque-than-captured sparkle is still fully removed (and on a dark background, where the fixed alpha would over-subtract and leave a dark spot, it automatically inpaints the small sparkle footprint instead); the Doubao, Jimeng, and Samsung text marks re-rasterize slightly per image, so a thin residual inpaint over the glyph footprint clears the leftover edges (the alpha maps are reproducibly rebuilt from controlled captures by `scripts/visible_alpha_solve.py`). Fast, offline, no GPU. `visible --mark auto` finds and removes the strongest detected mark. (For arbitrary logos/objects, see `erase`.)
+- **Visible watermark removal** — a registry of known marks in their usual places: the Gemini / Nano Banana sparkle, the Doubao "豆包AI生成" text strip, the Jimeng "★ 即梦AI" wordmark, and the Samsung Galaxy AI "✦ Contenuti generati dall'AI" strip (bottom-left, locale-specific). Each mark is **localized to a footprint mask, then filled**: the engine finds the mark, builds a binary mask over its footprint, and one shared, swappable fill inpaints that region. Choose the fill with `--backend`: `cv2` (classical inpaint, no deps, the floor), `migan` (MI-GAN, light, the preferred default when the `migan` extra is installed), or `lama` (big-LaMa, best quality, heavier, explicit opt-in); the default `auto` uses MI-GAN if installed, else cv2. The localizer is cheap CPU (cv2/numpy), so it runs anywhere; the heavier MI-GAN/LaMa fill is opt-in. Detection keys on each mark's own shape (NCC against a captured silhouette; the alpha captures rebuilt by `scripts/visible_alpha_solve.py` are used to detect and to shape the mask, not for pixel recovery). The visual detector needs no metadata, but a borderline (faint or moved) mark is only trusted with corroboration: `--sensitivity` (default `auto`) relaxes a mark's gate when local metadata confirms the vendor or a same-product sibling mark is found; `--sensitivity assume-ai` relaxes every mark on the assertion that the image is AI, recovering the moved or re-rendered marks the conservative gate skips on a metadata-stripped screenshot (`strict` never relaxes). `visible --mark auto` finds and removes every detected mark in one pass. Fast, offline, no GPU. (For arbitrary logos/objects, see `erase`.)
 - **Universal region eraser (`erase`)** — remove any logo / watermark / object inside boxes you specify, regardless of position or colour. Default cv2 inpainting (CPU, instant); optional big-LaMa via onnxruntime (`lama` extra) for higher quality
 - **Invisible watermark removal** — SynthID, StableSignature, TreeRing via diffusion-based regeneration (needs a local GPU, or run it with no setup on [raiw.cc](https://raiw.cc))
 - **AI metadata stripping** — EXIF, PNG text chunks, C2PA provenance manifests (PNG / JPEG / AVIF / HEIF / JPEG-XL, **MP4 / MOV / M4V / M4A** at the container level, and **WebM / MP3 / WAV / FLAC / OGG** losslessly via ffmpeg), XMP DigitalSourceType
@@ -48,7 +48,7 @@ It does **not** target watermarks that protect someone else's paid or copyrighte
 
 | AI model | Visible watermark | Invisible watermark | Metadata | Our approach |
 | --- | --- | --- | --- | --- |
-| **Google Gemini / Nano Banana / Gemini 3 Pro** | ✅ Sparkle logo | ✅ SynthID v1 + v2 (default SDXL pipeline, native resolution) | ✅ C2PA + EXIF | Alpha reversal + diffusion + metadata strip |
+| **Google Gemini / Nano Banana / Gemini 3 Pro** | ✅ Sparkle logo | ✅ SynthID v1 + v2 (default SDXL pipeline, native resolution) | ✅ C2PA + EXIF | Localize + fill + diffusion + metadata strip |
 | **OpenAI DALL-E 3 / ChatGPT** | — | — | ✅ C2PA manifest | Metadata strip |
 | **OpenAI ChatGPT Images 2.0** (gpt-image-2) | — | ✅ SynthID + content-specific pixel watermark (since May 2026; no local decoder, openai.com/verify oracle) | ✅ C2PA manifest (verified) | Diffusion regeneration + metadata strip |
 | **Stable Diffusion / SDXL (AUTOMATIC1111, ComfyUI)** | — | ✅ DWT-DCT (imwatermark — locally detectable) | ✅ PNG text chunks | Diffusion regeneration + metadata strip |
@@ -59,14 +59,14 @@ It does **not** target watermarks that protect someone else's paid or copyrighte
 | **xAI Grok (Aurora)** | — | — | ✅ EXIF signature scheme (no C2PA): `Signature:` blob + UUID `Artist` | Detected (`identify`); metadata strip |
 | **Midjourney** | — | — | ✅ EXIF + XMP (prompt, model, seed) | Metadata strip |
 | **Meta AI** | — | — | ✅ IPTC "Made with AI" (digitalSourceType) | Metadata strip (removes the label) |
-| **Doubao** (ByteDance) / China AIGC generators | ✅ "豆包AI生成" text strip (bottom-right) | — | ✅ TC260 AIGC label (`<TC260:AIGC>` XMP, `AIGC` PNG chunk, or EXIF JSON) **+ C2PA** signed by ByteDance Volcano Engine (`volcengine`) | Reverse-alpha (captured α map) + thin residual inpaint, NCC-aligned across resolutions, + metadata strip |
-| **Jimeng / Dreamina** (即梦AI, ByteDance) | ✅ "★ 即梦AI" wordmark (bottom-right) | — | ✅ TC260 AIGC label + C2PA (Volcano Engine) | Reverse-alpha (captured α map) + residual inpaint over the glyph footprint, NCC-aligned across resolutions, + metadata strip |
-| **Samsung Galaxy AI** (Generative Edit, Sketch to Image, ...) | ✅ "✦ Contenuti generati dall'AI" strip (bottom-left, locale-specific) | — | ✅ C2PA (signer "Samsung Galaxy") + `trainedAlgorithmicMedia` / proprietary `genAIType` marker | Reverse-alpha (captured α map) + thin residual inpaint, NCC-aligned across resolutions, + metadata strip |
+| **Doubao** (ByteDance) / China AIGC generators | ✅ "豆包AI生成" text strip (bottom-right) | — | ✅ TC260 AIGC label (`<TC260:AIGC>` XMP, `AIGC` PNG chunk, or EXIF JSON) **+ C2PA** signed by ByteDance Volcano Engine (`volcengine`) | Localize glyph footprint + fill + metadata strip |
+| **Jimeng / Dreamina** (即梦AI, ByteDance) | ✅ "★ 即梦AI" wordmark (bottom-right) | — | ✅ TC260 AIGC label + C2PA (Volcano Engine) | Localize glyph footprint + fill + metadata strip |
+| **Samsung Galaxy AI** (Generative Edit, Sketch to Image, ...) | ✅ "✦ Contenuti generati dall'AI" strip (bottom-left, Italian-locale detection) | — | ✅ C2PA (signer "Samsung Galaxy") + `trainedAlgorithmicMedia` / proprietary `genAIType` marker | Localize glyph footprint + fill + metadata strip |
 | **Black Forest Labs** (FLUX API) | — | — | ✅ C2PA (`Black Forest Labs API` + `c2pa.ai_generated_content` + `trainedAlgorithmicMedia`) | Metadata strip |
 | **StableSignature** (Meta) | — | ✅ In-model watermark | — | Diffusion regeneration |
 | **TreeRing** | — | ✅ Latent space watermark | — | Diffusion regeneration |
 
-> Visible overlays are used by Google Gemini / Nano Banana (sparkle logo), by ByteDance's Doubao ("豆包AI生成" corner text) and Jimeng / Dreamina ("★ 即梦AI" wordmark), and by Samsung Galaxy AI ("✦ Contenuti generati dall'AI" strip, bottom-left, locale-specific). All are removed on CPU by reverse-alpha against a captured alpha map (Jimeng and Samsung add a thin residual inpaint over the glyph footprint, since their marks re-rasterize per image). Other services rely on invisible watermarks and/or metadata; our diffusion-based regeneration works against any invisible watermark in pixel or frequency domain. For a visible mark from any other source (any position, any colour), use the universal `erase --region` command.
+> Visible overlays are used by Google Gemini / Nano Banana (sparkle logo), by ByteDance's Doubao ("豆包AI生成" corner text) and Jimeng / Dreamina ("★ 即梦AI" wordmark), and by Samsung Galaxy AI ("✦ Contenuti generati dall'AI" strip, bottom-left, locale-specific). All are removed by localizing the mark to a footprint mask and inpainting it with one shared fill (cv2 by default, MI-GAN or big-LaMa via `--backend`); the localizer is CPU-cheap and the heavier fills are opt-in. Other services rely on invisible watermarks and/or metadata; our diffusion-based regeneration works against any invisible watermark in pixel or frequency domain. For a visible mark from any other source (any position, any colour), use the universal `erase --region` command.
 
 > **Detection:** `remove-ai-watermarks identify <image>` reports the origin platform and watermark inventory for all the signals above — C2PA issuer, the C2PA soft-binding forensic-watermark vendor (TrustMark / Digimarc / Imatag / ...), IPTC "Made with AI" plus the IPTC 2025.1 `AISystemUsed` field, the China TC260 AIGC label (XMP, PNG chunk, EXIF, or JPEG segment), the HuggingFace `hf-job-id` job marker, embedded generation params, EXIF/XMP generator tags, the xAI/Grok EXIF signature, the SynthID metadata proxy, the C2PA cloud-manifest reference (Adobe Durable Content Credentials, when the embedded manifest is stripped), the visible marks (Gemini sparkle plus the Doubao "豆包AI生成" / Jimeng "即梦AI" / Samsung Galaxy AI "Contenuti generati dall'AI" text marks), and (with the `[detect]` / `[trustmark]` extras) the open SD/SDXL/FLUX and Adobe TrustMark invisible watermarks. SynthID and the proprietary soft-binding watermarks (Digimarc etc.) have no local decoder, so they are reported by metadata proxy / vendor name only.
 
@@ -80,25 +80,19 @@ Google Gemini (internally codenamed **Nano Banana**) adds a visible sparkle logo
 watermarked = α × logo + (1 − α) × original
 ```
 
-We reverse this with a known alpha map (extracted from Gemini / Nano Banana output on a pure-black background):
+A multi-scale NCC (Normalized Cross-Correlation) detector finds the sparkle position and scale dynamically in the bottom-right region (with a false-positive gate), so it works even if the image was resized or cropped. Removal is **localize then fill**: the sparkle footprint is built from the captured alpha thresholded low (so the faint halo is included) and dilated by a sparkle-relative margin, and that mask is inpainted by the shared fill. The captured alpha maps are used only to detect the sparkle and to shape the mask, not to recover pixels. If local metadata already confirms Google (a Google / Gemini C2PA issuer), the detection trust gate is relaxed so a moved or re-rendered sparkle is still caught. Pick the fill with `--backend` (cv2 default, MI-GAN or big-LaMa opt-in).
 
-```text
-original = (watermarked − α × logo) / (1 − α)
-```
-
-A three-stage NCC (Normalized Cross-Correlation) detector finds the watermark position and scale dynamically, so it works even if the image was resized or cropped. After removal, residual sparkle-edge artifacts are cleaned via gradient-masked inpainting.
-
-**Speed**: ~0.05s per image. No GPU needed.
+**Speed**: fast on CPU with the default cv2 fill. No GPU needed.
 
 ### Removing the Doubao "豆包AI生成" text watermark
 
-Doubao (ByteDance) stamps every output with a light, semi-transparent "豆包AI生成" text strip in the bottom-right corner — the visible AIGC label mandated by China's TC260 standard. It is a fixed semi-transparent white overlay, so it is removed by **reverse-alpha blending**: `original = (watermarked - α·logo) / (1 - α)`, recovering the true pixels instead of hallucinating them. The α map is solved from controlled black/gray captures (rebuildable with `scripts/visible_alpha_solve.py`). Like the Jimeng mark, Doubao re-rasterizes its text slightly per image, so reverse-alpha is followed by a thin residual inpaint over the glyph footprint to clear the leftover edges, and the α template is NCC-aligned to the actual mark (handling per-image scale/position jitter). Detection matches the same glyph silhouette against the corner (normalized correlation), so it keys on the "豆包AI生成" shape, not on textured corners.
+Doubao (ByteDance) stamps every output with a light, semi-transparent "豆包AI生成" text strip in the bottom-right corner — the visible AIGC label mandated by China's TC260 standard. Detection matches the glyph silhouette against the corner (normalized correlation), so it keys on the "豆包AI生成" shape, not on textured corners. Removal is **localize then fill**: the light glyph blob is localized to a solid, dilated footprint mask (template-free, so a re-rendered or differently-placed mark is still masked) and the shared fill inpaints it. On corpus images the filled region blends into its surroundings within a few LAB levels, with no colour shift and no dark pit. Pick the fill with `--backend` (cv2 default, MI-GAN or big-LaMa opt-in).
 
-**Speed**: ~0.05s, no GPU needed.
+**Speed**: fast on CPU with the default cv2 fill, no GPU needed.
 
 ### Removing the Jimeng "★ 即梦AI" wordmark
 
-Jimeng / Dreamina (即梦AI, also ByteDance, distinct from Doubao) stamps a "★ 即梦AI" wordmark — a four-point sparkle followed by the 即梦AI characters — in the bottom-right corner. It is a fixed semi-transparent **pure-white** overlay, solved from controlled black / gray / white captures the same way as Doubao. `visible --mark auto` detects and removes it (or force it with `--mark jimeng`). One difference from Doubao: Jimeng re-rasterizes its mark slightly differently per image, so a single alpha map does not cancel it pixel-for-pixel — reverse-alpha knocks the mark down and a residual inpaint over the glyph footprint clears the remaining outline. The two ByteDance marks do not confuse `auto`: detection keys on each mark's own glyph shape (the Jimeng detector scores far below its threshold on a Doubao strip, and vice versa).
+Jimeng / Dreamina (即梦AI, also ByteDance, distinct from Doubao) stamps a "★ 即梦AI" wordmark — a four-point sparkle followed by the 即梦AI characters — in the bottom-right corner. Detection keys on the wordmark's glyph shape (NCC against a captured silhouette). `visible --mark auto` detects and removes it (or force it with `--mark jimeng`). Removal is **localize then fill**: the glyph blob is localized to a solid, dilated footprint mask and the shared fill inpaints it, so a re-rendered or differently-placed mark is still cleared. On corpus images the filled region blends into its surroundings within a few LAB levels, no colour shift. The two ByteDance marks do not confuse `auto`: detection keys on each mark's own glyph shape (the Jimeng detector scores far below its threshold on a Doubao strip, and vice versa).
 
 ```bash
 remove-ai-watermarks visible jimeng.png -o clean.png            # --mark auto picks Jimeng
@@ -107,7 +101,7 @@ remove-ai-watermarks visible jimeng.png --mark jimeng -o clean.png
 
 ### Removing the Samsung Galaxy AI "✦ Contenuti generati dall'AI" mark
 
-Samsung's on-device Generative AI edits (Generative Edit, Sketch to Image, Portrait Studio) burn a visible sparkle + "generated with AI" string into the **bottom-left** corner — a faint, low-opacity semi-transparent white overlay. It is solved from controlled black / gray / white captures the same way as Jimeng and removed by reverse-alpha plus a thin residual inpaint over the glyph footprint (the mark re-rasterizes per image, and the flat captures are smaller than real photos, so the alpha template is NCC-aligned and width-scaled to the actual mark). `visible --mark auto` detects and removes it (or force it with `--mark samsung`); being bottom-left it never confuses the bottom-right Gemini/Doubao/Jimeng marks. The string is **locale-specific** — this build is calibrated for the Italian "Contenuti generati dall'AI" variant; other locales need their own captured template (open a sample on issue #37).
+Samsung's on-device Generative AI edits (Generative Edit, Sketch to Image, Portrait Studio) burn a visible sparkle + "generated with AI" string into the **bottom-left** corner — a faint, low-opacity semi-transparent white overlay. Detection matches the glyph silhouette (NCC), and removal is **localize then fill**: the glyph blob is localized to a solid, dilated footprint mask and the shared fill inpaints it. `visible --mark auto` detects and removes it (or force it with `--mark samsung`); being bottom-left it never confuses the bottom-right Gemini/Doubao/Jimeng marks. **Detection is locale-specific** — this build detects only the Italian "Contenuti generati dall'AI" variant, so other Samsung locales are not detected (and thus not removed) and need their own captured detection template (open a sample on issue #37). The fill mask itself is locale-independent.
 
 ```bash
 remove-ai-watermarks visible samsung.jpg -o clean.jpg            # --mark auto picks Samsung
@@ -335,14 +329,23 @@ remove-ai-watermarks batch ./images/ --mode all
 # of a clean origin. Add --json for machine-readable output.
 remove-ai-watermarks identify image.png
 
-# Visible watermark only — fast, offline, CPU. --mark auto (default) finds the
-# strongest known mark (Gemini sparkle / Doubao "豆包AI生成" / Jimeng "即梦AI" /
+# Visible watermark only — fast, offline, CPU. --mark auto (default) removes every
+# detected known mark (Gemini sparkle / Doubao "豆包AI生成" / Jimeng "即梦AI" /
 # Samsung Galaxy AI "Contenuti generati dall'AI"); force one with
-# --mark gemini / doubao / jimeng / samsung. Removed by reverse-alpha (true-pixel recovery).
+# --mark gemini / doubao / jimeng / samsung. Removal localizes each mark to a
+# footprint mask and inpaints it with a shared fill; --backend auto|cv2|migan|lama
+# (default auto) picks the fill (auto = MI-GAN if installed, else cv2).
+# --sensitivity auto|strict|assume-ai (default auto) sets how hard a borderline
+# mark is trusted; use assume-ai on a metadata-stripped screenshot to recover a
+# moved or faint mark the conservative gate would skip.
 # If no known visible mark is found, it writes no output and exits 2 (not 0),
 # pointing you to `all` (for an invisible/metadata mark) or `erase` (for an
 # arbitrary logo) instead of handing back the unchanged image.
 remove-ai-watermarks visible image.png -o clean.png
+
+# Metadata-stripped screenshot: assert it is AI to relax detection and recover
+# a moved/faint mark (a wrong guess just fills a small corner near-losslessly).
+remove-ai-watermarks visible screenshot.png --sensitivity assume-ai -o clean.png
 
 # Erase arbitrary region(s) — universal, any logo/watermark/object, any position.
 # Default cv2 inpainting (CPU). --backend lama uses big-LaMa (extra 'lama').
@@ -390,20 +393,30 @@ remove-ai-watermarks batch ./images/ --mode all
 
 ### Python API
 
+One high-level call removes every detected visible mark (Gemini sparkle, Doubao / Jimeng / Samsung text, the Jimeng pill) by localize then fill. For a file it reads metadata provenance automatically and preserves the alpha channel; `import remove_ai_watermarks` stays cheap (the heavy deps load lazily on first use).
+
 ```python
-from remove_ai_watermarks.gemini_engine import GeminiEngine
+import remove_ai_watermarks as raiw
+
+# Clean a file -> writes clean.png, returns the array and what was removed.
+result, removed = raiw.remove_visible("watermarked.png", "clean.png")
+print("removed:", removed)          # e.g. ['Google Gemini sparkle']
+# An empty list means nothing known was found (route to `all` or `erase` instead).
+
+# Array in, array out (BGR numpy). Pick the fill backend: cv2 (default), migan, lama.
 import cv2
+clean, removed = raiw.remove_visible(cv2.imread("in.png"), backend="cv2")
 
-engine = GeminiEngine()
-image = cv2.imread("watermarked.png")
+# Metadata-stripped screenshot you know is AI-generated: relax detection to recover a
+# moved or faint mark (a wrong guess just fills a small corner near-losslessly).
+raiw.remove_visible("screenshot.png", "clean.png", sensitivity="assume_ai")
 
-# Detect
-result = engine.detect_watermark(image)
-print(f"Detected: {result.detected} (confidence: {result.confidence:.1%})")
+# What the file's metadata confirms (drives the default `auto` sensitivity):
+raiw.visible_provenance("in.png")   # e.g. frozenset({'gemini'})
 
-# Remove
-clean = engine.remove_watermark(image)
-cv2.imwrite("clean.png", clean)
+# Full provenance verdict (platform + watermark inventory + confidence):
+from remove_ai_watermarks.identify import identify
+report = identify("in.png")
 ```
 
 #### Invisible removal (diffusion)
@@ -487,7 +500,7 @@ Won't fix:
 
 ## Limitations
 
-- **Visible-mark and metadata removal is lossless.** Reverse-alpha recovers the original pixels under the mark; metadata stripping never touches image data.
+- **Visible-mark removal is localized inpainting; metadata removal is lossless.** Each visible mark is localized to a footprint mask and filled by inpainting (cv2, MI-GAN, or big-LaMa), so only the small masked region is reconstructed and it blends into its surroundings within a few LAB levels; a slightly-off localization just fills a small region near-losslessly rather than leaving a colour-shifted smear. Metadata stripping never touches image data.
 - **The invisible (SynthID) path is lossy and not guaranteed.** It runs a low-strength SDXL img2img regeneration, so it softens fine detail and is content-dependent. There is no public SynthID decoder, so the tool cannot verify removal locally; confirm with the Gemini app's "Verify with SynthID" oracle and raise `--strength` if it still detects. A vendor can change the scheme at any time, so treat this as an arms race, not a permanent fix.
 - **Large images: native by default, opt-in tiling for OOM.** The SynthID path runs at the diffusion model's native resolution; on a memory-constrained GPU/MPS you can either cap the long side with `--max-resolution` (lossy downscale) or pass `--tile` to regenerate in overlapping, feather-blended tiles at native resolution (lossless, no seam). Tiling is a memory workaround, not a quality upgrade over a single native pass: each tile is an independent low-strength regeneration. (Nano Banana 2 is natively 1024px; GPT Image 2 supports 4K experimentally.)
 - **Out of scope:** defeating trained AI-vs-real classifiers like Hive (see [Threat model](#threat-model)), visible-logo removal from video, and any guarantee that a stripped copy is untraceable server-side.

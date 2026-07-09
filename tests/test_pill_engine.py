@@ -93,27 +93,28 @@ class TestFootprintFlatness:
 
 
 class TestPillRegistry:
-    def test_pill_is_capture_less(self) -> None:
+    def test_pill_registered_top_left(self) -> None:
         m = registry.get_mark("jimeng_pill")
-        assert m.has_capture is False
+        assert m.location == "top-left"
+        assert m.in_auto is True
 
-    def test_capture_less_routes_every_method_to_inpaint(self) -> None:
-        # a capture-less mark cannot reverse-alpha; even explicit reverse-alpha -> inpaint
-        assert registry.resolve_removal_method("reverse-alpha", False) == "inpaint"
-        assert registry.resolve_removal_method("auto", False) == "inpaint"
-        assert registry.resolve_removal_method("inpaint", False) == "inpaint"
+    def test_pill_mask_is_top_left_via_registry(self) -> None:
+        # The registry mask callable delegates to the pill engine's top-left footprint.
+        mask = registry.get_mark("jimeng_pill")._mask(np.full((1600, 1200, 3), 150, np.uint8))
+        assert mask is not None
+        assert mask.any()
 
 
 class TestPillGate:
     """Pill removal is gated (``_keep_pill``): the reliable bottom-right wordmark
-    removes it unrestricted, the metadata-only arm removes it ONLY on a flat footprint
-    (safe inpaint), Doubao/no-confirmation never remove it. Fakes detect_marks so no
-    image content is needed; cv2 backend so nothing downloads. Frame flatness matters
-    now, so tests pass a flat or a textured frame explicitly."""
+    removes it unrestricted, the metadata (``"jimeng"`` provenance) / assume_ai arm
+    removes it ONLY on a flat footprint (safe fill), Doubao/no-confirmation never
+    remove it. Fakes each mark's detect so no image content is needed; cv2 backend so
+    nothing downloads. Frame flatness matters, so tests pass a flat or textured frame."""
 
     @staticmethod
     def _fakes(monkeypatch: pytest.MonkeyPatch, keys: set[str]) -> None:
-        from remove_ai_watermarks.watermark_registry import MarkDetection
+        from remove_ai_watermarks.watermark_registry import KnownMark, MarkDetection
 
         labels = {
             "doubao": "Doubao 豆包AI生成 text",
@@ -121,40 +122,52 @@ class TestPillGate:
             "jimeng_pill": "Jimeng AI生成 pill",
         }
         monkeypatch.setattr(registry, "preferred_inpaint_backend", lambda: "cv2")
-        monkeypatch.setattr(
-            registry,
-            "detect_marks",
-            lambda image, *, include_explicit=True: [
-                MarkDetection(k, labels[k], "loc", True, 0.6, (10, 10, 40, 40)) for k in keys
-            ],
-        )
+
+        def fake_detect(self: KnownMark, image: object, *, provenance: bool = False) -> MarkDetection:
+            return MarkDetection(
+                self.key, labels.get(self.key, self.key), "loc", self.key in keys, 0.6, (10, 10, 40, 40)
+            )
+
+        monkeypatch.setattr(registry.KnownMark, "detect", fake_detect)
 
     def test_pill_kept_with_metadata_on_flat_footprint(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # metadata-only + flat background -> safe inpaint, remove
+        # jimeng provenance (TC260) + flat background -> safe fill, remove
         self._fakes(monkeypatch, {"jimeng_pill"})
-        _, removed = registry.remove_auto_marks(np.full((400, 300, 3), 150, np.uint8), pill_metadata=True)
+        _, removed = registry.remove_auto_marks(np.full((400, 300, 3), 150, np.uint8), provenance=frozenset({"jimeng"}))
         assert "Jimeng AI生成 pill" in removed
 
     def test_pill_dropped_with_metadata_on_textured_footprint(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # metadata-only + textured background (ceiling-like) -> inpaint would smear, skip
+        # jimeng provenance + textured background (ceiling-like) -> fill would smear, skip
         self._fakes(monkeypatch, {"jimeng_pill"})
-        _, removed = registry.remove_auto_marks(_textured_frame(), pill_metadata=True)
+        _, removed = registry.remove_auto_marks(_textured_frame(), provenance=frozenset({"jimeng"}))
         assert "Jimeng AI生成 pill" not in removed
 
     def test_pill_kept_via_wordmark_ignores_texture(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # wordmark confirmation (~94% precise, survives metadata stripping) is NOT
         # texture-gated: a wordmark-confirmed pill is removed even on a textured frame
         self._fakes(monkeypatch, {"jimeng", "jimeng_pill"})
-        _, removed = registry.remove_auto_marks(_textured_frame(), pill_metadata=False)
+        _, removed = registry.remove_auto_marks(_textured_frame())
         assert "Jimeng AI生成 pill" in removed
+
+    def test_pill_kept_via_assume_ai_on_flat_footprint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # assume_ai (no metadata) removes the pill on a flat footprint (safe fill)...
+        self._fakes(monkeypatch, {"jimeng_pill"})
+        _, removed = registry.remove_auto_marks(np.full((400, 300, 3), 150, np.uint8), sensitivity="assume_ai")
+        assert "Jimeng AI生成 pill" in removed
+
+    def test_pill_dropped_via_assume_ai_on_textured_footprint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # ...but even assume_ai keeps the flatness guard (textured false fires smear).
+        self._fakes(monkeypatch, {"jimeng_pill"})
+        _, removed = registry.remove_auto_marks(_textured_frame(), sensitivity="assume_ai")
+        assert "Jimeng AI生成 pill" not in removed
 
     def test_pill_dropped_without_metadata_or_wordmark(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._fakes(monkeypatch, {"jimeng_pill"})
-        _, removed = registry.remove_auto_marks(np.full((400, 300, 3), 150, np.uint8), pill_metadata=False)
+        _, removed = registry.remove_auto_marks(np.full((400, 300, 3), 150, np.uint8))
         assert "Jimeng AI生成 pill" not in removed
 
     def test_pill_dropped_on_doubao_even_with_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._fakes(monkeypatch, {"doubao", "jimeng_pill"})
-        _, removed = registry.remove_auto_marks(np.full((400, 300, 3), 150, np.uint8), pill_metadata=True)
+        _, removed = registry.remove_auto_marks(np.full((400, 300, 3), 150, np.uint8), provenance=frozenset({"jimeng"}))
         assert "Doubao 豆包AI生成 text" in removed
         assert "Jimeng AI生成 pill" not in removed
