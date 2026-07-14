@@ -178,6 +178,54 @@ class TestFp16WeightVariant:
         assert "variant" not in cls.from_pretrained.call_args.kwargs
 
 
+class TestNoReembeddedWatermark:
+    """F2 regression: the SDXL removal pipelines must disable the diffusers default
+    invisible watermarker (``add_watermarker=False``).
+
+    diffusers stamps an open "Stable Diffusion XL" DWT-DCT watermark onto every SDXL
+    output whenever ``invisible-watermark`` is installed. A watermark REMOVER that left
+    it on would replace one detectable AI watermark (SynthID) with another -- the cleaned
+    output re-reads as AI. The ControlNet sub-model load must NOT receive the kwarg (it
+    is not a pipeline and does not accept it).
+    """
+
+    def _remover(self, profile: str):
+        if not is_watermark_removal_available():
+            pytest.skip("torch/diffusers not installed")
+        from remove_ai_watermarks.noai.watermark_remover import WatermarkRemover
+
+        return WatermarkRemover(device="cpu", pipeline=profile)
+
+    def _capture(self, monkeypatch, remover):
+        from remove_ai_watermarks.noai.watermark_remover import WatermarkRemover
+
+        calls: list[tuple[str, dict]] = []
+
+        def fake_load(self, cls, model_id, **kwargs):
+            calls.append((getattr(cls, "__name__", str(cls)), kwargs))
+            return MagicMock()
+
+        monkeypatch.setattr(WatermarkRemover, "_load_from_pretrained", fake_load)
+        monkeypatch.setattr(WatermarkRemover, "_move_to_device_and_optimize", lambda self, p: p)
+        return calls
+
+    def test_sdxl_pipeline_disables_watermarker(self, monkeypatch: pytest.MonkeyPatch):
+        remover = self._remover("sdxl")
+        calls = self._capture(monkeypatch, remover)
+        remover._load_pipeline()
+        assert any(kw.get("add_watermarker") is False for _, kw in calls), calls
+
+    def test_controlnet_pipeline_disables_watermarker(self, monkeypatch: pytest.MonkeyPatch):
+        remover = self._remover("controlnet")
+        calls = self._capture(monkeypatch, remover)
+        remover._load_controlnet_pipeline()
+        by_cls = dict(calls)
+        # the SDXL pipeline load disables the watermarker...
+        assert by_cls["StableDiffusionXLControlNetImg2ImgPipeline"].get("add_watermarker") is False
+        # ...but the ControlNet sub-model load must not carry the kwarg (it would error).
+        assert "add_watermarker" not in by_cls["ControlNetModel"]
+
+
 class _StubImage:
     """Minimal PIL.Image stand-in: just the ``width``/``height`` the pure helper reads."""
 

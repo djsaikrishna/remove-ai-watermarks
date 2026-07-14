@@ -447,6 +447,19 @@ class WatermarkRemover:
             self._set_progress("Loading fp16-fixed SDXL VAE (avoids black output)...")
             load_kwargs["vae"] = AutoencoderKL.from_pretrained(_SDXL_FP16_VAE_ID, torch_dtype=torch.float16)
 
+    @staticmethod
+    def _disable_sdxl_watermarker(load_kwargs: dict[str, Any]) -> None:
+        """Turn off the diffusers default invisible watermarker on an SDXL pipeline.
+
+        diffusers embeds an open "Stable Diffusion XL" DWT-DCT invisible watermark on
+        EVERY SDXL output whenever ``invisible-watermark`` is installed (the ``detect``
+        extra). A watermark REMOVER must not re-stamp a detectable AI watermark, or the
+        cleaned output re-reads as AI (``identify`` -> "Open invisible watermark: Stable
+        Diffusion XL"). Shared by both SDXL loaders; the ``ControlNetModel`` sub-model
+        and the Qwen loader never call it (only the pipeline accepts the kwarg).
+        """
+        load_kwargs["add_watermarker"] = False
+
     def _move_to_device_and_optimize(self, pipeline: Any) -> Any:
         """Move a freshly-loaded pipeline to ``self.device`` + enable memory opts.
 
@@ -520,6 +533,7 @@ class WatermarkRemover:
             load_kwargs = self._base_load_kwargs()
             load_kwargs["safety_checker"] = None
             load_kwargs["requires_safety_checker"] = False
+            self._disable_sdxl_watermarker(load_kwargs)
             self._maybe_add_fp16_vae(load_kwargs)
 
             pipeline = self._load_from_pretrained(AutoImg2ImgPipeline, self.model_id, **load_kwargs)  # type: ignore
@@ -549,6 +563,7 @@ class WatermarkRemover:
 
             load_kwargs = self._base_load_kwargs()
             load_kwargs["controlnet"] = controlnet
+            self._disable_sdxl_watermarker(load_kwargs)
             self._maybe_add_fp16_vae(load_kwargs)
 
             self._set_progress(f"Loading model weights: {self.model_id}")
