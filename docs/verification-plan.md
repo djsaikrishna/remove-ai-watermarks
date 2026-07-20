@@ -259,6 +259,43 @@ confirmed, with numbers, for the first time.
 **The invariant held**: 0 violations of "the fill touches nothing outside its mask" across
 all 720 measurements and all three backends.
 
+#### Visible parity, first full run, 2026-07-20 (10,593 image/mark pairs, cv2)
+
+| mark | n | detector-clean after removal |
+|---|---|---|
+| jimeng | 298 | 100% (CI 98.7-100) |
+| gemini | 4,974 | 95.3% (CI 94.7-95.8) |
+| doubao | 2,580 | 91.8% (CI 90.7-92.8) |
+| samsung | 3 | 100% (CI 43.8-100) |
+| jimeng_pill | 2,738 | 32.4% -- **wrong path, see below** |
+| **excluding the pill** | **7,855** | **94.3% (CI 93.8-94.8)** |
+
+Backend-independence was CHECKED, not assumed: the same 309 pairs through cv2 / MI-GAN /
+LaMa agree within one image on doubao (91.9% x3), gemini (91.4 / 92.1 / 91.4) and jimeng
+(100% x3). Only the pill diverges (32.5 / 25.0 / 25.0), and 17 of the 18 disagreements are
+the pill. So one backend suffices for parity; quality is B1's job, not this sweep's.
+
+**The residual is NOT one phenomenon -- it splits by mark.** Checking whether a still-
+detected mark carries vendor provenance independent of the visual detector, against the
+cleaned marks as a control:
+
+| mark | still detected | cleaned | reading |
+|---|---|---|---|
+| doubao | 82.9% corroborated | 80.0% | indistinguishable -- the marks are REAL |
+| gemini | 39.6% | 62.4% | significantly lower -- much of it is false fires that persist |
+
+The doubao half turned out to be the front-end mismatch bug (fixed 2026-07-20, see the
+CLAUDE.md rule): `remove()` was a silent no-op on 57 of 60 sampled cases because the
+binarized mask came back empty. After the fix, 60/60 of those clear, so doubao parity
+should now sit near 99%; **the sweep has not been re-run to confirm that**.
+
+Method note: two intermediate checks were worthless and both looked meaningful.
+`MarkDetection.region` for a text mark is the GEOMETRY box derived from frame dimensions,
+not a match position, so "the detector's box did not move after the fill" was predetermined,
+and "the mask covers 96.5% of the detected region" compared geometry against the same
+geometry. What actually answered it: looking at the pixels, and testing whether `remove()`
+changed the array at all.
+
 #### The Jimeng pill: measure the GATED path or the number is meaningless
 
 The parity audit calls `get_mark(key).remove`, which bypasses `_keep_pill`. On the pill
@@ -499,6 +536,7 @@ would take, so none of it has to be rediscovered.
 |---|---|---|---|
 | 1 | 16-bit PNGs are downconverted to 8-bit by a metadata strip | 42 of 27,018 corpus PNGs (0.16%); one went 9.2 MB -> 2.5 MB | a byte-level PNG chunk stripper, so the PIL re-save is skipped entirely |
 | 2 | Exit code 2 means three different things (no visible mark / no invisible signal / Click usage error) | any wrapper must parse stderr to tell them apart | split the codes; **breaking for existing wrappers**, so it needs a deliberate call |
+| 3a | the full visible-parity sweep has NOT been re-run since the doubao front-end fix | doubao parity should move 91.8% -> ~99%, unconfirmed | re-run `visible_removal_audit.py --paths-file data/spaces/_visible_positives.txt --backend cv2` (~2 h) |
 | 3 | `visible_removal_audit.py` measures the UNGATED per-mark path | reports the pill at 32% where the product runs at 100% precision | teach it the product path (`remove_auto_marks`) for gated marks, or at minimum say so loudly in its docstring |
 
 ### Dependency alert
