@@ -89,8 +89,31 @@ def engine_for(mark_key: str) -> Any:
     return cls()
 
 
-def stamp(image: np.ndarray, mark_key: str) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
-    """Composite a mark's alpha glyph into its canonical corner. Returns (stamped, bbox)."""
+def composite(image: np.ndarray, alpha: np.ndarray, x: int, y: int) -> np.ndarray:
+    """The single forward model every stamp uses: ``stamped = (1-a)*bg + a*white``.
+
+    ``alpha`` is float and clipped to [0,1] here, so a caller may pre-multiply it by an
+    opacity factor without worrying about overflow. Shared by ``stamp``/``stamp_slot``
+    here and by ``scripts/detector_response.py`` (which imports it) so the model is
+    written ONCE.
+    """
+    gh, gw = alpha.shape[:2]
+    out = image.copy()
+    roi = out[y : y + gh, x : x + gw].astype(np.float32)
+    a3 = np.clip(alpha, 0.0, 1.0)[..., None]
+    out[y : y + gh, x : x + gw] = np.clip(roi * (1 - a3) + 255.0 * a3, 0, 255).astype(np.uint8)
+    return out
+
+
+def stamp(
+    image: np.ndarray, mark_key: str, *, size_mult: float = 1.0, alpha_mult: float = 1.0
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    """Composite a mark's alpha glyph into its canonical corner. Returns (stamped, bbox).
+
+    ``size_mult`` scales the glyph box off the engine's nominal geometry and ``alpha_mult``
+    its opacity -- both default to 1.0 (the geometry the engine assumes), and
+    `scripts/detector_response.py` sweeps them to build response curves.
+    """
     from remove_ai_watermarks._text_mark_engine import load_alpha_template
 
     engine = engine_for(mark_key)
@@ -101,19 +124,15 @@ def stamp(image: np.ndarray, mark_key: str) -> tuple[np.ndarray, tuple[int, int,
 
     loc = engine.locate(image)
     base = engine.scale_base(image)
-    gw = max(cfg.min_gw, int(cfg.alpha_width_frac * base))
-    gh = max(4, int(cfg.alpha_height_frac * base))
+    gw = max(cfg.min_gw, int(cfg.alpha_width_frac * base * size_mult))
+    gh = max(4, int(cfg.alpha_height_frac * base * size_mult))
     if gw < 8 or gh < 4 or gw > loc.w or gh > loc.h:
         return None
 
-    a = cv2.resize(alpha, (gw, gh), interpolation=cv2.INTER_AREA).astype(np.float32)
+    a = cv2.resize(alpha, (gw, gh), interpolation=cv2.INTER_AREA).astype(np.float32) * alpha_mult
     x = loc.x + (loc.w - gw) // 2
     y = loc.y + (loc.h - gh) // 2
-    out = image.copy()
-    roi = out[y : y + gh, x : x + gw].astype(np.float32)
-    a3 = a[..., None]
-    out[y : y + gh, x : x + gw] = np.clip(roi * (1 - a3) + 255.0 * a3, 0, 255).astype(np.uint8)
-    return out, (x, y, gw, gh)
+    return composite(image, a, x, y), (x, y, gw, gh)
 
 
 def _slot_alpha(mark_key: str) -> np.ndarray | None:
@@ -134,12 +153,15 @@ def _slot_alpha(mark_key: str) -> np.ndarray | None:
     return None
 
 
-def stamp_slot(image: np.ndarray, mark_key: str) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+def stamp_slot(
+    image: np.ndarray, mark_key: str, *, size_mult: float = 1.0, alpha_mult: float = 1.0
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
     """Stamp a mark into its OWN default footprint slot (the `--no-detect` geometry).
 
     Used for gemini and the pill, which have no bundled alpha asset with corner
     fractions. The mark is fitted into the middle of its slot so the fill has to
-    recover the same kind of region it would in production.
+    recover the same kind of region it would in production. ``size_mult``/``alpha_mult``
+    match ``stamp`` (both default to 1.0).
     """
     from remove_ai_watermarks.watermark_registry import get_mark
 
@@ -154,21 +176,21 @@ def stamp_slot(image: np.ndarray, mark_key: str) -> tuple[np.ndarray, tuple[int,
         return None
     y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
     bw, bh = x1 - x0 + 1, y1 - y0 + 1
-    gw, gh = max(8, int(bw * 0.7)), max(8, int(bh * 0.7))
-    if gw < 8 or gh < 8 or gw > image.shape[1] or gh > image.shape[0]:
-        return None
-    a = cv2.resize(alpha, (gw, gh), interpolation=cv2.INTER_AREA).astype(np.float32)
-    a = np.clip(a, 0.0, 1.0)
+    gw, gh = max(8, int(bw * 0.7 * size_mult)), max(8, int(bh * 0.7 * size_mult))
+    a = cv2.resize(alpha, (gw, gh), interpolation=cv2.INTER_AREA).astype(np.float32) * alpha_mult
     x, y = x0 + (bw - gw) // 2, y0 + (bh - gh) // 2
-    out = image.copy()
-    roi = out[y : y + gh, x : x + gw].astype(np.float32)
-    a3 = a[..., None]
-    out[y : y + gh, x : x + gw] = np.clip(roi * (1 - a3) + 255.0 * a3, 0, 255).astype(np.uint8)
-    return out, (x, y, gw, gh)
+    # A large size_mult can grow the glyph past its slot and push x/y negative; guard so
+    # composite never writes out of bounds (numpy would wrap a negative index silently).
+    if x < 0 or y < 0 or x + gw > image.shape[1] or y + gh > image.shape[0]:
+        return None
+    return composite(image, a, x, y), (x, y, gw, gh)
 
 
-def stamp_any(image: np.ndarray, mark_key: str) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
-    return stamp(image, mark_key) if mark_key in STAMPABLE else stamp_slot(image, mark_key)
+def stamp_any(
+    image: np.ndarray, mark_key: str, *, size_mult: float = 1.0, alpha_mult: float = 1.0
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    fn = stamp if mark_key in STAMPABLE else stamp_slot
+    return fn(image, mark_key, size_mult=size_mult, alpha_mult=alpha_mult)
 
 
 def clean_sources(n: int, seed: int = 11) -> list[Path]:

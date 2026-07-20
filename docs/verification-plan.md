@@ -358,12 +358,66 @@ optimizing PSNR, and a faint mark is still a mark. What it says is that the fill
 cost, it is now measurable, and for faint marks it exceeds the thing it removes -- which
 makes "how faint is too faint" a product decision that can finally be made on evidence.
 
-### B2. Detector response curves
+### B2. Detector response curves -- RUN 2026-07-20
 
-Stamp marks across a controlled grid -- size, contrast, background texture, aspect,
-JPEG quality -- and measure detection rate per cell. Produces a recall **curve** instead of
-a point estimate, and directly tests the `scale_basis` geometry that hid a 100% landscape
-miss for months. Cheap, repeatable, no human in the loop.
+`scripts/detector_response.py`. Stamp marks across a controlled grid (size x contrast,
+crossed with real corpus backgrounds and frame aspects) and measure two things per cell:
+`detected`, and whether the same call path then yields a non-empty removal mask
+(`maskable`). The second column exists because the gap between them is a silent no-op --
+`identify` reports a mark that `visible` skips -- and any detection-only harness scores
+that bug as a success.
+
+**Read the nominal cell, never the aggregate.** The grid deliberately visits sizes and
+opacities no engine was calibrated for, so its overall rate is an adversarial score, not
+recall. Production recall still comes from the unbiased corpus sample.
+
+What it found:
+
+- **The size response is a COMB, not a curve.** `_tophat_score` sweeps exactly three rungs
+  (0.8, 1.0, 1.25). Doubao scores ~0.99 at each rung and collapses to 0.37-0.48 between
+  them, against a 0.50 gate -- so a mark ~10% off a rung is missed at FULL contrast. The
+  `binary` front-end has no ladder at all: jimeng holds one lobe over 0.90-1.20, samsung
+  only 0.95-1.05, i.e. samsung requires a mark at essentially its exact nominal size.
+- **Contrast is nearly irrelevant** on the tophat front-end -- the response is
+  max-normalized, so a mark at 15 luma levels of contrast still scores 0.984.
+- **No detected-but-unmaskable cells** at any grid point, so the front-end/mask parity fix
+  holds across the whole operating range, not just where the corpus happened to look.
+
+And the follow-up that stopped a bad change: dead zones only cost recall if real marks land
+in them. `scripts/ladder_headroom.py` measured that on the corpus (positives = frames whose
+metadata names the vendor, negatives = frames with no metadata signal, deliberately NOT
+filtered on the detector's own verdict, which would make its false-fire rate 0 by
+construction). A 13-rung dense ladder recovers **28 of 368 misses (7.6%)** while false fire
+goes **2.52% -> 3.05%**. So the comb is real and mostly unvisited: the fractions were
+calibrated on real captures and real marks cluster at the rungs. **Do not densify the
+ladder** on this evidence.
+
+The residual looked like a clean lead and, on a full 923-positive / 3546-negative run,
+turned out not to be. A targeted `plus_one` ladder (one extra rung at ~1.116) recovers 36
+of the 39 marks the 13-rung dense ladder recovers -- so the win really is that one rung,
+not density. But **all 36 recoveries AND all 18 of its added false fires are LANDSCAPE at
+that same rung** (2.0:1 overall, 1.7:1 even gated to landscape). The rung is not vendor
+signal; it is a size shift that helps and hurts equally.
+
+And the obvious "fix it at the source" -- bump the landscape width fraction so that
+subpopulation lands on the nominal rung -- is **falsified by the same data**: the 55
+currently-DETECTED landscape positives already peak at scale 1.0, not 1.116. So there are
+two size clusters of landscape doubao marks, one at the calibrated nominal and one ~11%
+larger, and moving the nominal would drop the cluster that works to catch the one that does
+not. The larger cluster is genuinely a different size and is inseparable from landscape
+false fire at the NCC gate -- the same detector-discrimination wall as vendor attribution,
+not a geometry constant anyone forgot to set. **Do not add the rung, and do not move the
+landscape fraction.** The per-rung scores are stored in `_ladder_headroom_doubao.jsonl` so
+this verdict can be re-derived without re-running the sweep.
+
+Why the misses are not a tuning problem: on the sampled misses the dense-ladder score is
+bimodal -- detected marks sit at median 0.938, misses at 0.155, and **the band 0.31-0.52 is
+empty**. There is no near-gate cluster, so no threshold recovers them. Eyeballing 26 miss
+corners explains it: ~6 are jimeng (TC260 names no vendor, so a "doubao positive" is often
+a jimeng frame), ~14 carry no visible mark in that corner at all, 2 belong to **uncovered
+vendors** (`千问AI生成`, `百度 AI生成`), and only ~4 are genuine doubao failures -- on
+saturated or structurally busy corners, with heterogeneous causes (the saturation gate
+explains exactly one of five tested).
 
 ### B3. Invisible round-trip, positive-control gated
 
@@ -536,8 +590,55 @@ would take, so none of it has to be rediscovered.
 |---|---|---|---|
 | 1 | 16-bit PNGs are downconverted to 8-bit by a metadata strip | 42 of 27,018 corpus PNGs (0.16%); one went 9.2 MB -> 2.5 MB | a byte-level PNG chunk stripper, so the PIL re-save is skipped entirely |
 | 2 | Exit code 2 means three different things (no visible mark / no invisible signal / Click usage error) | any wrapper must parse stderr to tell them apart | split the codes; **breaking for existing wrappers**, so it needs a deliberate call |
-| 3a | the full visible-parity sweep has NOT been re-run since the doubao front-end fix | doubao parity should move 91.8% -> ~99%, unconfirmed | re-run `visible_removal_audit.py --paths-file data/spaces/_visible_positives.txt --backend cv2` (~2 h) |
+| 3a | ~~the full visible-parity sweep has NOT been re-run since the doubao front-end fix~~ **DONE 2026-07-20** | doubao parity moved **91.8% -> 99.3%** (2562/2580) as predicted; gemini/jimeng/samsung unchanged, `_visible_parity_cv2_v2.csv` | closed |
 | 3 | `visible_removal_audit.py` measures the UNGATED per-mark path | reports the pill at 32% where the product runs at 100% precision | teach it the product path (`remove_auto_marks`) for gated marks, or at minimum say so loudly in its docstring |
+| 4 | the faint-mask fallback fills the WHOLE corner box, not the glyph | 12 of 12 real faint-path frames covered 100% of the corner ROI (120.9% median with padding); the path fires on ~8% of doubao detections | fixed 2026-07-20 -- see below |
+
+**Defect 4 in full, because it is instructive.** The fallback I added on 2026-07-19 reads
+`np.where(resp >= _FAINT_GLYPH_LEVEL)` with the constant at `0.5`, and its comment says
+"thresholded relative to its own peak". But `tophat_response` returns **uint8 0..255**, so
+`>= 0.5` selects every pixel with value >= 1 -- the entire non-zero response, not half the
+peak. Measured against alternatives on 14 real frames (cv2 fill, detector re-run after):
+
+| mask | detector clean after | median filled area (% of corner box) |
+|---|---|---|
+| `thr0.5` (as shipped) | 100% | 120.9% |
+| `thr190` | 100% | 68.5% |
+| largest connected component at 190 | **21%** | 10.5% |
+| **the detector's own best-match box** | 100% | **58.7%** |
+
+The fix is the last row: the correlation already located the mark at a position and scale,
+so thresholding its response was always a weaker proxy for information we had. The
+connected-component variant is rejected outright -- it is the tightest but removes the mark
+on only 21% of frames, i.e. it does not cover it.
+
+Two things about how this was found are worth keeping:
+
+- **Parity could not see it.** Parity asks whether the detector is clean after removal, and
+  a mask that fills everything passes trivially. The defect was in the COST, and nothing
+  measured cost on that path. A green parity run is not evidence about mask size.
+- **The regression test could not see it either, by construction.** Its fixture is a FLAT
+  frame, where the top-hat response is non-zero only on the glyph, so every threshold gives
+  the same bounding box. Mutating the constant to an absurd 99.0 left it green. The fixture
+  now carries texture, which is the condition under which sizing matters and what real
+  corner backgrounds look like -- and it reproduces the corpus number exactly (127% of the
+  corner box, against 120.9% measured).
+
+### Latent, pre-existing, not fixed this pass
+
+The detect-fires / mask-empty silent no-op that fix 4 closed on the `tophat` front-end has a
+**narrower cousin on the `binary` front-end** (jimeng/samsung), surfaced by the /simplify
+altitude review. Binary detection gates on `coverage >= detect_min_coverage` (a FRACTION)
+while the mask gates on `xs.size >= _MIN_GLYPH_PIXELS = 20` (an absolute COUNT), both on the
+same blob. For samsung (`detect_min_coverage = 0.01`) they disagree in a small-image band
+(width ~200-294 px): detection can fire at 10-19 glyph px while the 20-px mask floor returns
+None -> the identical observable. It is NOT introduced by this work (the `else: return None`
+fall-through predates it), it sits well below real mark sizes (captured positives are
+1086-2048 px wide), and fixing it means changing binary detection's gate to match the mask's
+-- which needs its own per-mark measurement. So the "cannot drift by construction" claim is
+scoped to `tophat` (where score and box are one computation); the binary path is coupled but
+by a threshold pair that can still disagree at the edges. Fix only alongside a binary-mark
+detector change, never on its own.
 
 ### Dependency alert
 
@@ -549,10 +650,31 @@ patched torch version exists -- do not re-triage it", which is now stale. Either
 (it is transitive from the optional `gpu` extra) or re-dismiss on the remaining grounds
 (the codebase never calls `torch.jit`, grep-verified) and correct that note.
 
+### Where detection work should go next
+
+Measured this session, in the order the evidence supports:
+
+1. **Not the ladder, not the threshold, not the landscape rung.** All three were measured
+   to completion and all three are dead ends: the dense ladder buys 7.6% of misses for a
+   21% relative rise in false fire; the score band below the gate is empty so no threshold
+   recovers the misses; and the one targeted rung that helps (1.116, landscape) adds false
+   fire at 1.7:1 because the recoveries and the false fires are the same landscape size
+   shift. Moving the landscape width fraction is also out -- detected landscape marks
+   already sit at the nominal, so it would break more than it fixes. Do not spend here.
+2. **Coverage of uncovered vendors is the largest lever** and is blocked on EVIDENCE, not
+   architecture. `千问` and `百度` marks sit in the same corner we already scan, and the
+   front-end that `render_vendor_silhouettes.py` said was missing now exists. But this
+   session found exactly one confirmed positive per vendor, and the 14 千问 positives that
+   note quotes are not reachable from any current script. Nothing may be registered off a
+   single frame. Harvest 30+ per vendor with `scripts/cjk_tail_probe.py`, then calibrate.
+3. **A generic shared-tail template is not a shortcut.** `AI生成` is guaranteed across
+   compliant vendors by GB 45438-2025, so one template covering all of them is the obvious
+   idea -- and measured on the tophat front-end it separates a bold 千问 positive from clean
+   corners by only 0.407 vs a clean p99 of 0.298. A 4-glyph run is simply less specific
+   than a 6-glyph one. Treat it as a harvesting aid, not a detector.
+
 ### Verification tiers not run
 
-- **B2 detector response curves** -- recall as a function of size, contrast and background
-  texture on stamped marks. No labelling needed.
 - **B4 resource ceilings** -- peak RSS and wall time per backend x input size to 25 MP.
 - **E robustness** -- truncated, corrupt, absurd dimensions, decompression bombs, unicode
   and RTL filenames, read-only output dirs, concurrent runs on one file.
@@ -560,11 +682,11 @@ patched torch version exists -- do not re-triage it", which is now stale. Either
 
 ### Recommended next step
 
-**B2, before any detector work.** Jimeng recall rests on n=14 and the pill's on n=6;
-improving what six samples measure means not knowing whether it improved. B2 is also the
-instrument that catches the geometry class of bug that has now surfaced twice -- the
-`scale_basis` landscape miss, and the detect/mask front-end mismatch that made ~8% of
-Doubao detections unremovable.
+**Harvest labelled positives for the uncovered vendors.** Everything cheaper has now been
+measured and found empty, and every remaining question -- can 千问 be registered, what gate,
+does the landscape rung generalize -- is blocked on the same missing thing: labelled
+examples. Jimeng recall still rests on n=14 and the pill's on n=6, so those are equally
+unimprovable-because-unmeasurable.
 
 ## Standing gap
 

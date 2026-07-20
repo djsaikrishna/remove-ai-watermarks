@@ -45,6 +45,35 @@ almost nothing and, at any threshold low enough to fire, fires on arbitrary corn
 
 星绘 additionally has only ONE confirmed example in the corpus, so even a working
 front-end could not have its threshold calibrated yet.
+
+UPDATE 2026-07-20: the named blocker is GONE, and the retry is still inconclusive.
+`detect_frontend="tophat"` (built later, for doubao) is exactly the "grayscale correlation
+on the raw top-hat" this note asked for, so the 2026-07-18 ruling rests on a premise that
+no longer holds and must not simply be inherited. Two things were measured against it, and
+neither settles the question:
+
+  * A GENERIC template of the shared `AI生成` tail -- attractive because GB 45438-2025
+    guarantees that run across vendors, so one template would cover 千问 / 百度 / 星绘 and
+    anything compliant that ships next. Measured on the tophat front-end at the shipped
+    3-rung ladder: a bold 千问 positive scores 0.407 against clean corners at p99 0.298 /
+    max 0.321. It separates on that one frame, but only by a hair, and a 4-glyph template
+    is inherently less specific than a 6-glyph one -- the shorter the run, the more
+    arbitrary corner structure correlates with it.
+  * The FULL 千问 template on the same front-end scores 0.248 against a clean max of 0.537,
+    i.e. no separation at all -- WORSE than the generic tail, which is the opposite of
+    what the specificity argument predicts and is itself a reason to distrust n=1.
+
+The blocker is now EVIDENCE, not architecture: this session found exactly one 千问 and one
+百度 positive (both by eyeballing doubao-provenance misses), and the 14 positives quoted
+above were not preserved anywhere the current scripts can reach. Nothing should be
+registered off a single frame. What it takes: harvest 30+ confirmed positives per vendor
+-- `scripts/cjk_tail_probe.py` exists for exactly this, scoring TC260-provenance frames
+that no detector fires on and writing a contact sheet of the top scorers to label -- then
+calibrate a gate against the clean arm. Two traps worth knowing before repeating this
+measurement: score with `alpha_height_frac`, not the silhouette's own aspect ratio (the
+latter inflated the clean p99 from 0.30 to 0.58 and made every comparison meaningless),
+and keep the ladder at the shipped 3 rungs, since a wide sweep hands clean corners many
+extra chances to match.
 """
 
 from __future__ import annotations

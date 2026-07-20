@@ -90,13 +90,6 @@ _MIN_DETECT_SHORT_SIDE = 200
 # threshold repairs that -- it needs a better detection silhouette.
 _DEFAULT_PROVENANCE_NCC_FACTOR = 0.7
 
-# Level (fraction of the response's own peak) at which the CONTINUOUS top-hat is
-# turned into a glyph blob, used only when the binarized path found nothing on a
-# mark the detector did fire on. Half the peak keeps the stroke cores and drops the
-# halo; the enclosing rectangle is what gets filled anyway, so this only has to be
-# good enough to BOUND the mark, not to segment it.
-_FAINT_GLYPH_LEVEL = 0.5
-
 
 @dataclass(frozen=True)
 class TextMarkConfig:
@@ -346,20 +339,30 @@ class TextMarkEngine:
             return None
         return (resp / peak * 255).astype(np.uint8)
 
-    def _tophat_score(self, image: NDArray[Any], loc: TextMarkLocation) -> float:
-        """TM_CCOEFF_NORMED of a soft template against the continuous response.
+    def _tophat_best(
+        self, image: NDArray[Any], loc: TextMarkLocation
+    ) -> tuple[float, tuple[int, int, int, int] | None]:
+        """Best TM_CCOEFF_NORMED of a soft template against the continuous response, and
+        the ROI-local box (x0, y0, x1, y1) where that best match sits.
 
         Sweeps a small scale band: the nominal glyph size is derived from the mark's
         geometry, but a vendor re-rasterization shifts it by a few percent and the
         continuous response is sharp enough that an exact-size template would miss.
+
+        Detection and the removal mask BOTH read this one method -- the score gates
+        detection, the box bounds the fill. Sharing it is deliberate: the standing rule is
+        that detection and the mask use the same front-end, and the way that rule was last
+        broken was a drift between two separate implementations. One method makes the drift
+        impossible instead of merely discouraged.
         """
         c = self.config
         resp = self.tophat_response(image, loc)
         sil = self._glyph_silhouette()
         if resp is None or sil is None:
-            return 0.0
+            return (0.0, None)
         base = self.scale_base(image)
-        best = 0.0
+        best_score = 0.0
+        best_box: tuple[int, int, int, int] | None = None
         for scale in (0.8, 1.0, 1.25):
             gw = max(c.min_gw, int(c.alpha_width_frac * base * scale))
             gh = max(4, int(c.alpha_height_frac * base * scale))
@@ -368,8 +371,16 @@ class TextMarkEngine:
             tmpl = cv2.resize(sil, (gw, gh), interpolation=cv2.INTER_AREA).astype(np.float32)
             if c.template_blur > 0:
                 tmpl = cv2.GaussianBlur(tmpl, (0, 0), sigmaX=c.template_blur, sigmaY=c.template_blur)
-            best = max(best, float(cv2.matchTemplate(resp, tmpl.astype(np.uint8), cv2.TM_CCOEFF_NORMED).max()))
-        return best
+            result = cv2.matchTemplate(resp, tmpl.astype(np.uint8), cv2.TM_CCOEFF_NORMED)
+            _, score, _, top_left = cv2.minMaxLoc(result)
+            if score > best_score:
+                tx, ty = int(top_left[0]), int(top_left[1])
+                best_score, best_box = float(score), (tx, ty, tx + gw - 1, ty + gh - 1)
+        return (best_score, best_box)
+
+    def _tophat_score(self, image: NDArray[Any], loc: TextMarkLocation) -> float:
+        """The detection score alone -- the box the removal mask needs is discarded here."""
+        return self._tophat_best(image, loc)[0]
 
     def scale_base(self, image: NDArray[Any]) -> int:
         """The image dimension this mark's geometry scales with.
@@ -557,25 +568,29 @@ class TextMarkEngine:
         bx, by, bw, bh = loc.bbox
         glyph = self.extract_mask(image, loc)  # box-sized, 255 = glyph
         ys, xs = np.where(glyph > 0)
-        faint = xs.size < self._MIN_GLYPH_PIXELS and self.config.detect_frontend == "tophat"
-        # A mark found only by the CONTINUOUS front-end has no binary glyph blob to bound,
-        # so the mask came back empty and removal was a silent no-op while `identify` still
-        # reported the mark (corpus-measured 2026-07-20: 57 of 60 sampled still-detected
-        # Doubao marks were untouched, ~8% of its detections). Fall back to the same
-        # response the DETECTOR scored, thresholded relative to its own peak. Gated on an
-        # actual detection: the response is max-normalized, so on a clean corner it would
-        # normalize NOISE up to 1.0 and mask a random patch -- the detector's verdict is
-        # what separates signal from noise here.
-        if faint and self.detect(image).detected:
-            resp = self.tophat_response(image, loc)
-            if resp is not None:
-                ys, xs = np.where(resp >= _FAINT_GLYPH_LEVEL)
+        box: tuple[int, int, int, int] | None = None
         if xs.size >= self._MIN_GLYPH_PIXELS:
+            box = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+        elif self.config.detect_frontend == "tophat" and self.detect(image).detected:
+            # A mark found only by the CONTINUOUS front-end has no binary glyph blob to
+            # bound, so the mask came back empty and removal was a silent no-op while
+            # `identify` still reported the mark (corpus-measured 2026-07-20: 57 of 60
+            # sampled still-detected Doubao marks were untouched, ~8% of its detections).
+            # Use the DETECTOR'S OWN best-match box: the correlation already located the
+            # mark at a position and scale, and thresholding the response was a strictly
+            # worse proxy for that. An earlier fix thresholded the max-normalized uint8
+            # response at 0.5 -- which selects every non-zero pixel, not "half the peak" as
+            # its comment claimed -- and filled ~120% of the corner box on textured frames
+            # (measured: whole corner vs 58.7% for the match box, both detector-clean).
+            # Gated on an actual detection: on a clean corner the box would be spurious.
+            _, box = self._tophat_best(image, loc)
+        if box is not None:
+            gx0, gy0, gx1, gy1 = box
             pad = max(4, int(0.10 * bh))
-            rx1 = max(0, bx + int(xs.min()) - pad)
-            rx2 = min(w, bx + int(xs.max()) + 1 + pad)
-            ry1 = max(0, by + int(ys.min()) - pad)
-            ry2 = min(h, by + int(ys.max()) + 1 + pad)
+            rx1 = max(0, bx + gx0 - pad)
+            rx2 = min(w, bx + gx1 + 1 + pad)
+            ry1 = max(0, by + gy0 - pad)
+            ry2 = min(h, by + gy1 + 1 + pad)
         elif force:
             rx1, ry1, rx2, ry2 = bx, by, min(w, bx + bw), min(h, by + bh)
         else:
