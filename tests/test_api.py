@@ -49,7 +49,7 @@ class TestRemoveVisibleArray:
 
     def test_array_accepts_knobs(self):
         arr = np.zeros((256, 256, 3), np.uint8)
-        result, removed = raiw.remove_visible(arr, sensitivity="assume_ai", backend="cv2")
+        result, removed = raiw.remove_visible(arr, sensitivity="strict", backend="cv2")
         assert removed == []
         assert result.shape == arr.shape
 

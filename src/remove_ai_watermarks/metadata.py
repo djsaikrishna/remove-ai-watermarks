@@ -1076,6 +1076,27 @@ def _sniff_image_format(head: bytes) -> str | None:
     return None
 
 
+def strip_and_verify(
+    source_path: Path,
+    output_path: Path | None = None,
+    *,
+    keep_standard: bool = True,
+) -> tuple[Path, dict[str, str]]:
+    """Strip AI metadata, then RE-SCAN the output and report what survived.
+
+    :func:`remove_ai_metadata` is deliberately fail-safe: a file PIL cannot decode is
+    copied through UNCHANGED rather than crashing a caller, and the path it returns is
+    indistinguishable from a real strip. Any caller that reports an outcome to a user
+    therefore cannot tell a no-op from a success -- corpus-observed on real Samsung
+    Galaxy S22 C2PA PNGs, where `metadata --remove` printed "stripped" and exited 0 while
+    the output still read as AI (2026-07-19 parity audit).
+
+    Returns ``(output_path, surviving_markers)``; an empty mapping means a real strip.
+    """
+    out = remove_ai_metadata(source_path, output_path, keep_standard=keep_standard)
+    return out, get_ai_metadata(out)
+
+
 def remove_ai_metadata(
     source_path: Path,
     output_path: Path | None = None,

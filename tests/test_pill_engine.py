@@ -107,10 +107,10 @@ class TestPillRegistry:
 
 class TestPillGate:
     """Pill removal is gated (``_keep_pill``): the reliable bottom-right wordmark
-    removes it unrestricted, the metadata (``"jimeng"`` provenance) / assume_ai arm
-    removes it ONLY on a flat footprint (safe fill), Doubao/no-confirmation never
-    remove it. Fakes each mark's detect so no image content is needed; cv2 backend so
-    nothing downloads. Frame flatness matters, so tests pass a flat or textured frame."""
+    removes it unrestricted, the metadata arm (``"jimeng"`` provenance) removes it ONLY
+    on a flat footprint (safe fill), Doubao/no-confirmation never remove it. Fakes each
+    mark's detect so no image content is needed; cv2 backend so nothing downloads. Frame
+    flatness matters, so tests pass a flat or textured frame."""
 
     @staticmethod
     def _fakes(monkeypatch: pytest.MonkeyPatch, keys: set[str]) -> None:
@@ -149,16 +149,10 @@ class TestPillGate:
         _, removed = registry.remove_auto_marks(_textured_frame())
         assert "Jimeng AI生成 pill" in removed
 
-    def test_pill_kept_via_assume_ai_on_flat_footprint(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # assume_ai (no metadata) removes the pill on a flat footprint (safe fill)...
+    def test_pill_dropped_on_textured_footprint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The metadata arm keeps the flatness guard: textured false fires visibly smear.
         self._fakes(monkeypatch, {"jimeng_pill"})
-        _, removed = registry.remove_auto_marks(np.full((400, 300, 3), 150, np.uint8), sensitivity="assume_ai")
-        assert "Jimeng AI生成 pill" in removed
-
-    def test_pill_dropped_via_assume_ai_on_textured_footprint(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # ...but even assume_ai keeps the flatness guard (textured false fires smear).
-        self._fakes(monkeypatch, {"jimeng_pill"})
-        _, removed = registry.remove_auto_marks(_textured_frame(), sensitivity="assume_ai")
+        _, removed = registry.remove_auto_marks(_textured_frame(), provenance=frozenset({"jimeng"}))
         assert "Jimeng AI生成 pill" not in removed
 
     def test_pill_dropped_without_metadata_or_wordmark(self, monkeypatch: pytest.MonkeyPatch) -> None:

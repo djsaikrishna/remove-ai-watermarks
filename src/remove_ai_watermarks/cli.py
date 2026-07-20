@@ -307,14 +307,13 @@ _visible_backend_option = click.option(
 _visible_sensitivity_option = click.option(
     "--sensitivity",
     "sensitivity",
-    type=click.Choice(["auto", "strict", "assume-ai"]),
+    type=click.Choice(["auto", "strict"]),
     default="auto",
     help="How hard to trust a borderline mark. auto: relax a mark only when metadata "
     "or a same-product sibling mark corroborates it (safe; clean images untouched). "
-    "strict: high-precision visual gate only, never relaxed. assume-ai: treat the "
-    "image as AI and relax every mark, keeping a confidence floor where the vendor is "
-    "unconfirmed (best recall on metadata-stripped screenshots; a clean image is still "
-    "left untouched).",
+    "strict: high-precision visual gate only, never relaxed. To act on a mark YOU can "
+    "see but the detector missed, use 'erase --region' or '--mark <name> --no-detect' "
+    "rather than a blanket relaxation.",
 )
 
 
@@ -396,13 +395,12 @@ def _remove_visible_auto(
 
 
 def _parse_sensitivity(value: str) -> watermark_registry.Sensitivity:
-    """Map the CLI ``--sensitivity`` choice (kebab ``assume-ai``) to the registry
-    literal (``assume_ai``); ``auto``/``strict`` pass through unchanged."""
-    if value == "assume-ai":
-        return "assume_ai"
-    if value == "strict":
-        return "strict"
-    return "auto"
+    """Map the CLI ``--sensitivity`` choice to the registry literal.
+
+    A pass-through since ``assume-ai`` was removed (2026-07-19); kept as the single
+    conversion point so a future kebab-cased choice has an obvious home.
+    """
+    return "strict" if value == "strict" else "auto"
 
 
 # Exit code for the standalone ``visible`` command when no visible mark was
@@ -412,7 +410,7 @@ def _parse_sensitivity(value: str) -> watermark_registry.Sensitivity:
 EXIT_NO_VISIBLE_MARK = 2
 
 
-def _no_visible_mark_exit(source: Path, *, sensitivity: str = "auto") -> NoReturn:
+def _no_visible_mark_exit(source: Path) -> NoReturn:
     """Explain why no visible watermark was removed, then exit non-zero.
 
     The visible registry handles only known visual marks (the Gemini sparkle and
@@ -423,10 +421,25 @@ def _no_visible_mark_exit(source: Path, *, sensitivity: str = "auto") -> NoRetur
     watermarked image -- the recurring "it didn't work" report. Instead, run a
     cheap metadata-only :func:`identify`, tell the user what the image actually
     carries and which command removes it, and exit
-    :data:`EXIT_NO_VISIBLE_MARK`. When the conservative detector found nothing and
-    the user has NOT already asked for the aggressive pass, point them at
-    ``--sensitivity assume-ai`` (a faint or moved visible mark may be sitting just
-    below the default gate).
+    :data:`EXIT_NO_VISIBLE_MARK`.
+
+    When the user can SEE a mark the detector missed, the honest next step is one that
+    executes their instruction rather than guessing harder. This used to recommend
+    ``--sensitivity assume-ai``, which did the opposite -- it relaxed every mark's gate
+    on a blanket assumption -- and that mode is gone (2026-07-19).
+
+    The advice is per-mark, because the forced paths are not equally reliable
+    (measured 2026-07-19):
+      * ``erase --region`` is always sound: the user supplies the coordinates, so there
+        is nothing to guess. This is the primary recommendation.
+      * ``--mark <text-mark> --no-detect`` is reasonable for the TEXT marks: the forced
+        mask is built from the actual glyph blob, non-empty on 13/13 real marks the
+        detector missed.
+      * ``--mark gemini --no-detect`` is NOT recommended and is deliberately not
+        suggested here: with no detection it falls back to a fixed default sparkle slot,
+        which covered the real sparkle on only **31% of 97** genuine sparkles the strict
+        gate missed (median offset 63px up-and-left). The other 69% fill a clean corner
+        AND report a removal that did not happen -- the worst outcome the tool has.
     """
     from remove_ai_watermarks.identify import identify
 
@@ -448,12 +461,13 @@ def _no_visible_mark_exit(source: Path, *, sensitivity: str = "auto") -> NoRetur
             "  If instead there is a logo or object to remove, target it with the region eraser:\n"
             f"    remove-ai-watermarks erase {source.name} --region x,y,w,h"
         )
-    if sensitivity != "assume_ai":
-        console.print(
-            "  If you know this image is AI-generated, retry the visible pass with\n"
-            f"    remove-ai-watermarks visible {source.name} --sensitivity assume-ai\n"
-            "  which relaxes detection to catch a faint or moved mark the default gate skips."
-        )
+    console.print(
+        "  If you can SEE a mark here that was not detected, point at it directly --\n"
+        "  that removes what you actually see instead of guessing:\n"
+        f"    remove-ai-watermarks erase {source.name} --region x,y,w,h\n"
+        "  For a known CJK text mark you can also force it by name:\n"
+        f"    remove-ai-watermarks visible {source.name} --mark doubao --no-detect"
+    )
     raise SystemExit(EXIT_NO_VISIBLE_MARK)
 
 
@@ -562,7 +576,7 @@ def _run_visible_auto(
     if not removed:
         # write_noop=False means nothing was written, so a pre-existing output is intact.
         console.print("  No known visible mark detected (gemini / doubao / jimeng / jimeng-pill / samsung).")
-        _no_visible_mark_exit(source, sensitivity=sensitivity)
+        _no_visible_mark_exit(source)
     console.print(f"  Removed: {', '.join(removed)}")
     size_kb = output.stat().st_size / 1024
     console.print(f"  Saved: {output}  ({size_kb:.0f} KB, {elapsed:.2f}s)")
@@ -592,7 +606,7 @@ def _run_visible_explicit(
     target = "gemini" if mark == "auto" else mark  # --no-detect auto: gemini fallback
     chosen = watermark_registry.get_mark(target)
     # A single explicit mark has no sibling corroboration. Keep its trust resolution
-    # aligned with the registry arbiter, including the assumption-only floor.
+    # aligned with the registry arbiter.
     trust = watermark_registry.resolve_trust(
         chosen.key,
         sensitivity=sensitivity,
@@ -601,12 +615,9 @@ def _run_visible_explicit(
     )
     relax = trust != "strict"
     detection = chosen.detect(image, provenance=relax)
-    if trust == "assumed" and not watermark_registry.assumed_floor_ok(chosen.key, detection.confidence):
-        relax = False
-        detection = chosen.detect(image, provenance=False)
     if detect and not detection.detected:
         console.print(f"  {chosen.label} not detected  (conf {detection.confidence:.2f}). Use --no-detect to force.")
-        _no_visible_mark_exit(source, sensitivity=sensitivity)
+        _no_visible_mark_exit(source)
     if detection.detected:
         console.print(f"  {chosen.label} detected  ({chosen.location}, conf {detection.confidence:.2f})")
 
@@ -954,7 +965,7 @@ def cmd_metadata(
     from WebM/MP3/WAV/FLAC/OGG. The coded image, audio, and video data are left
     untouched.
     """
-    from remove_ai_watermarks.metadata import get_ai_metadata, has_ai_metadata, remove_ai_metadata
+    from remove_ai_watermarks.metadata import get_ai_metadata, has_ai_metadata, strip_and_verify
 
     # No _validate_image() here: unlike the image-only commands, metadata also
     # accepts video/audio containers, so the image-format warning would misfire.
@@ -982,10 +993,16 @@ def cmd_metadata(
 
     # Remove
     try:
-        out = remove_ai_metadata(source, output, keep_standard=keep_standard)
+        out, leftover = strip_and_verify(source, output, keep_standard=keep_standard)
     except (OSError, ValueError) as e:  # unreadable / truncated / non-image (PIL raises OSError subclasses)
         console.print(f"  Error: cannot process {source.name}: {e}")
         raise SystemExit(1) from e
+
+    if leftover:
+        console.print(f"  FAILED: {len(leftover)} AI metadata marker(s) survived in {out}")
+        console.print(f"    still present: {', '.join(sorted(leftover))}")
+        console.print("    the file could not be decoded, so it was copied through unchanged")
+        raise SystemExit(1)
     console.print(f"  AI metadata stripped -> {out}")
 
 
@@ -1448,9 +1465,15 @@ def _process_batch_image(
         synthid_skipped = _run_batch_invisible(ctx, img_path, out_path, mode, options)
 
     if mode in ("metadata", "all"):
-        from remove_ai_watermarks.metadata import remove_ai_metadata
+        from remove_ai_watermarks.metadata import strip_and_verify
 
-        remove_ai_metadata(img_path if mode == "metadata" else out_path, out_path)
+        # Same verification the single-image command does: the fail-safe copy-through
+        # would otherwise leave an AI-reading output and still exit 0, contradicting the
+        # batch contract that a failed image must make the run exit non-zero.
+        _, leftover = strip_and_verify(img_path if mode == "metadata" else out_path, out_path)
+        if leftover:
+            msg = f"AI metadata survived the strip ({', '.join(sorted(leftover))}); file could not be decoded"
+            raise RuntimeError(msg)
 
     # In "all" mode, the invisible step (color-only OpenCV paths) drops alpha,
     # so re-attach the cached alpha when the input had transparency.

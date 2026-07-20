@@ -92,9 +92,9 @@ def _glyph_silhouette() -> NDArray[Any] | None:
     return _text_mark_engine.glyph_silhouette(_CONFIG.asset_name)
 
 
-def _template_match_score(box_mask: NDArray[Any], image_width: int) -> float:
+def _template_match_score(box_mask: NDArray[Any], scale_base: int) -> float:
     """TM_CCOEFF_NORMED of the Samsung glyph silhouette against ``box_mask``."""
-    return _text_mark_engine.template_match_score(box_mask, image_width, _CONFIG)
+    return _text_mark_engine.template_match_score(box_mask, scale_base, _CONFIG)
 
 
 class SamsungEngine(TextMarkEngine):

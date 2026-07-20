@@ -52,21 +52,26 @@ Backend = Literal["auto", "cv2", "migan", "lama"]
 #     evidence the mark is there -- metadata provenance for that vendor, or a confidently
 #     detected sibling mark of the same product (see ``resolve_trust``). No evidence ->
 #     stays strict. Safe: it only escalates where the mark is corroborated.
-#   * ``assume_ai``: relax every mark's gate regardless of evidence -- the caller asserts
-#     the image is AI and wants the mark gone (e.g. a metadata-stripped screenshot uploaded
-#     to a watermark remover). Recovers the faint/moved marks the strict gate demotes. The
-#     library CANNOT infer this from a stripped image -- only the caller's out-of-band
-#     context (the user uploaded to remove a mark) justifies it. An assertion that the
-#     image is AI is NOT evidence of WHICH vendor made it, so a mark relaxed on assumption
-#     alone must still clear ``_ASSUMED_CONF_FLOOR``; see that constant for why.
-Sensitivity = Literal["auto", "strict", "assume_ai"]
+#
+# REMOVED 2026-07-19: ``assume_ai`` relaxed every mark's gate on the caller's bare
+# assertion that the image is AI. It was a statistical gamble, not an instruction:
+# "this image is AI" says nothing about WHICH vendor or WHERE, which is exactly what a
+# gate bypass needs, so it took a confidence floor to be tolerable at all (before that
+# floor it filled a phantom sparkle on 59.8% of genuine camera photos). It also had no
+# place in the product's own model -- detector finds a mark, remove it; detector finds
+# nothing, leave the image alone; the USER sees a mark and says so, act on that. A user
+# who can see the mark is better served by pointing at it (``erase --region``) or naming
+# it (``--mark X --no-detect`` for a text mark), both of which execute an instruction
+# instead of guessing. Removing it also collapsed the trust ladder from three levels to
+# two. See docs/module-internals.md for the measurements.
+Sensitivity = Literal["auto", "strict"]
 
-# The trust level a mark's detection gate is resolved to (see ``resolve_trust``). The
-# split between ``assumed`` and ``confirmed`` is load-bearing: both bypass the engine's
-# false-positive gate, but only ``confirmed`` has evidence naming THIS vendor, which is
-# exactly what that bypass is documented to require (see GeminiEngine.detect_watermark's
-# ``trust_provenance`` contract). ``assumed`` therefore carries a confidence floor.
-Trust = Literal["strict", "assumed", "confirmed"]
+# The trust level a mark's detection gate is resolved to (see ``resolve_trust``).
+# ``confirmed`` bypasses the engine's false-positive gate, and that bypass is documented
+# to require evidence naming THIS vendor (see GeminiEngine.detect_watermark's
+# ``trust_provenance`` contract) -- so it is only ever reached from same-product evidence.
+# A third ``assumed`` level existed for ``assume_ai`` and went with it (2026-07-19).
+Trust = Literal["strict", "confirmed"]
 
 # Product family per mark, for the ``auto`` cross-mark corroboration: a confidently
 # detected mark relaxes only OTHER marks of the SAME product (different corners, one
@@ -80,6 +85,32 @@ _PRODUCT_OF: dict[str, str] = {
     "jimeng_pill": "jimeng",  # same product as the Jimeng wordmark
     "samsung": "samsung",
 }
+
+
+# Marks whose own detection is too weak to serve as EVIDENCE for a sibling of the
+# same product, even though they share one. Sibling corroboration grants ``confirmed``
+# trust, which bypasses the sibling's false-positive gate outright -- so a detector
+# that false-fires often must not be able to hand that bypass to anyone.
+#
+# The pill qualifies on its own documented numbers: ~7% raw false-fire (5.5% measured
+# on 578 vendor negatives, 2026-07-18). Letting it corroborate produced a closed loop
+# on the DEFAULT auto path, no user flag involved:
+#   pill false-fires on a clean non-ByteDance image
+#     -> _PRODUCT_OF maps it to "jimeng", so jimeng resolves to `confirmed`
+#     -> jimeng's NCC gate drops 0.45 -> 0.3825 and it false-fires too
+#     -> _keep_pill now sees "jimeng" in keys and takes the WORDMARK arm, which
+#        removes the pill unrestricted -- skipping the flatness guard that exists
+#        precisely to stop the fill smearing a textured corner.
+# Measured on the corpus: 3 of 578 negatives ran the full loop, one of them with
+# footprint_flat=0 (the exact case the guard was written to block). Cutting the pill
+# out of corroboration removed all 3 and cost NOTHING on 4417 TC260 carriers
+# (jimeng fires 398 -> 398), so this is a defect fix, not a recall trade.
+#
+# `_keep_pill` already encodes the same distrust for the pill's own ACTION; this
+# closes the gap that its TESTIMONY was never gated.
+# Regression: tests/test_watermark_registry.py::TestArbiter::
+#   test_weak_pill_detection_does_not_confirm_the_jimeng_wordmark
+_CANNOT_CORROBORATE: frozenset[str] = frozenset({"jimeng_pill"})
 
 
 @dataclass(frozen=True)
@@ -109,6 +140,32 @@ class Localization:
     mask: NDArray[Any] | None
 
 
+_REMOVED_SENSITIVITIES = {
+    "assume_ai": (
+        "sensitivity='assume_ai' was removed in 0.16: it relaxed EVERY mark's detection "
+        "gate on the bare assertion that an image is AI, which says nothing about which "
+        "vendor made it or where the mark is. If you can see a mark the detector missed, "
+        "act on what you see: erase(image, region=(x, y, w, h)), or the CLI "
+        "`--mark <name> --no-detect` for a known text mark. Use sensitivity='auto' for "
+        "the default evidence-driven behaviour."
+    )
+}
+
+
+def validate_sensitivity(value: str) -> Sensitivity:
+    """Reject a removed sensitivity LOUDLY instead of silently falling back to ``auto``.
+
+    ``Sensitivity`` is a ``Literal``, which is not enforced at runtime, so a caller
+    upgrading from 0.15 would pass ``"assume_ai"`` and quietly get ``auto`` behaviour --
+    a silent semantic change on the one release where they most need to be told.
+    """
+    if value in _REMOVED_SENSITIVITIES:
+        raise ValueError(_REMOVED_SENSITIVITIES[value])
+    if value not in ("auto", "strict"):
+        raise ValueError(f"unknown sensitivity {value!r}; expected 'auto' or 'strict'")
+    return value  # type: ignore[return-value]
+
+
 @dataclass(frozen=True)
 class Context:
     """The evidence + policy the removal arbiter decides against (perception is
@@ -120,6 +177,9 @@ class Context:
     sensitivity: Sensitivity = "auto"
     provenance: frozenset[str] = frozenset()
 
+    def __post_init__(self) -> None:
+        validate_sensitivity(self.sensitivity)
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -127,9 +187,8 @@ class Candidate:
 
     Carries the mark's verdict at BOTH trust levels (``detected_strict`` = the
     conservative gate, ``detected_relaxed`` = the gate the engine relaxes to under
-    provenance/assume), so the arbiter can pick per mark without re-running detection.
-    ``relaxed_confidence`` is the gate-bypassed detection's confidence, which the arbiter
-    needs to apply :func:`assumed_floor_ok` when a mark is relaxed on assumption alone.
+    provenance), so the arbiter can pick per mark without re-running detection.
+
     ``features`` is a generic bag of physical measurements a mark's gate may need (the
     mark owns which it reports via ``KnownMark._features``); e.g. the pill supplies
     ``footprint_flat`` (0/1). Empty for marks whose gate needs no extra evidence."""
@@ -138,7 +197,6 @@ class Candidate:
     label: str
     detected_strict: bool
     detected_relaxed: bool
-    relaxed_confidence: float
     features: dict[str, float]  # generic; both construction sites always supply it (empty when none)
 
 
@@ -240,16 +298,41 @@ GEMINI_SPARKLE_TRUST_CONF = 0.5
 _GEMINI_AUTO_MIN_CONF = GEMINI_SPARKLE_TRUST_CONF
 
 # Provenance-confirmed Gemini trust gate. When external metadata already proves the
-# image is a Google generation (C2PA issuer "Google"/"Gemini"), the [0.35, 0.5)
-# band that the no-provenance gate leaves out is no longer ambiguous with Doubao
-# text: a Doubao image carries ByteDance provenance, not Google, so it never reaches
-# this relaxed gate. The vendor moving/re-rendering the sparkle (bigger, lighter,
-# shifted north-west) drops a real sparkle into this band, and the fixed-slot
-# detector demotes it -- provenance is exactly the extra evidence that lets us trust
-# it. Set to the engine's own internal `detected` floor (0.35); combined with the
-# engine's FP-gate being skipped under provenance (see gemini_engine), this recovers
-# the moved-mark misses without touching the no-provenance precision.
-_GEMINI_PROVENANCE_MIN_CONF = 0.35
+# image is a Google generation (C2PA issuer "Google"/"Gemini"), the [gate, 0.5) band
+# that the no-provenance gate leaves out is no longer ambiguous with Doubao text: a
+# Doubao image carries ByteDance provenance, not Google, so it never reaches this
+# relaxed gate. The vendor moving/re-rendering the sparkle (bigger, lighter, shifted
+# north-west) drops a real sparkle into this band, and the fixed-slot detector demotes
+# it -- provenance is exactly the extra evidence that lets us trust it.
+#
+# The gate was originally the engine's own `detected` floor (0.35). Raised to 0.42
+# on 2026-07-18 after measuring what this arm actually admits, because the Doubao
+# argument above -- while correct -- is not the binding constraint. Google C2PA is
+# carried by Imagen, API generations and NotebookLM exports, none of which stamp a
+# visible sparkle at all, so the relaxed gate spends most of its budget on images
+# that never had a mark rather than on moved ones.
+#
+# Measured blind on 954 unique Google-metadata uploads (detector never saw the
+# metadata), hand-labelled against a two-sided control (labeller sensitivity ~88%,
+# specificity 100%). "Additions" = accepted with provenance but not without:
+#
+#   band         precision   95% CI    population
+#   0.35-0.42          13%    5-30%           120
+#   0.42-0.46          35%   19-54%            47
+#   0.46-0.50          27%   14-46%            44
+#   0.50-0.54          40%   20-64%            15
+#
+# Precision is flat above 0.42 and collapses below it, and that bottom band alone is
+# half the arm's volume -- so this is a step, not a gradient, and 0.42 is where it
+# sits. Raising the gate here drops ~16 genuine recoveries to prevent ~104 false
+# fills (6.5:1), cutting false fills from 18.7% to 7.8% of Google-metadata uploads.
+# A false fill is the worse error: it destroys pixels AND makes the caller report a
+# removal that did not happen, while a miss leaves the image untouched.
+#
+# NOTE: even at 0.42 this arm runs at ~33% precision (two false fills per genuine
+# recovery). Whether an arm that inaccurate should exist at all is a product call,
+# not a tuning one -- do not read this constant as "now correct".
+_GEMINI_PROVENANCE_MIN_CONF = 0.42
 
 # ── Engine adapters (lazy singletons; engines are cv2-only, no model load) ──
 
@@ -411,7 +494,7 @@ def _pill_mask(
 
 def _pill_features(image: NDArray[Any]) -> dict[str, float]:
     """The pill's own gate feature: top-left footprint flatness (1.0 = flat enough for
-    an invisible fill), read by the metadata/assume arm of :func:`_keep_pill`."""
+    an invisible fill), read by the metadata arm of :func:`_keep_pill`."""
     return {"footprint_flat": float(_engine("jimeng_pill").footprint_is_flat(image))}
 
 
@@ -457,36 +540,6 @@ def detect_marks(
     return [m.detect(image, provenance=m.key in provenance) for m in _REGISTRY if include_explicit or m.in_auto]
 
 
-# Minimum gate-bypassed confidence a mark must reach when it is relaxed on ASSUMPTION
-# (``assume_ai``) rather than on evidence naming its vendor. Relaxing bypasses the
-# engine's false-positive gate entirely, which is justified by vendor CONFIRMATION; an
-# assumption that the image is AI says nothing about WHICH vendor, so the bypassed
-# detector needs its own floor or it fires on ordinary content.
-#
-# Corpus-measured 2026-07-16 (256 genuine camera captures -- Make/Model/exposure/aperture
-# present and no AI token, so a Gemini sparkle cannot be there -- vs 697 Google-C2PA
-# positives, metadata used only as the label, never fed to the detector):
-#
-#     bypassed threshold   recall   false-fire on clean photos
-#              0.35         82.6%            59.8%     <- the bare detector gate
-#              0.45         66.6%            12.5%
-#              0.50         59.4%             0.0%     <- chosen
-#     strict gate          56.4%             0.0%
-#
-# So 0.35 sat on a cliff: it bought +26pp recall over strict by filling a corner on ~6
-# of every 10 CLEAN photos. At 0.50 the flag is honest -- it still beats strict, for free.
-# Marks absent from this dict relax identically at both levels; their bypassed false-fire
-# on the same negatives is under 1% (doubao 0.8%, jimeng 0.4%, samsung 0.4%).
-_ASSUMED_CONF_FLOOR: dict[str, float] = {"gemini": 0.50}
-
-
-def assumed_floor_ok(key: str, confidence: float) -> bool:
-    """Whether an ``assumed``-trust detection of ``key`` at ``confidence`` is trustworthy
-    enough to act on (see :data:`_ASSUMED_CONF_FLOOR`). Marks with no floor always pass."""
-    floor = _ASSUMED_CONF_FLOOR.get(key)
-    return floor is None or confidence >= floor
-
-
 def resolve_trust(
     key: str,
     *,
@@ -500,19 +553,19 @@ def resolve_trust(
     level (which the engines consume as ``provenance = level != "strict"``). ``strict``
     never relaxes. A mark is ``confirmed`` only on same-product evidence -- the vendor
     confirmed by metadata (``key in provenance``) or a confidently strict-detected
-    sibling of the same product (``_PRODUCT_OF``). Without that evidence, ``assume_ai``
-    yields ``assumed`` (relaxed, but subject to :func:`assumed_floor_ok`) and ``auto``
-    stays ``strict``."""
+    sibling of the same product (``_PRODUCT_OF``, minus the marks too weak to vouch,
+    :data:`_CANNOT_CORROBORATE`). Without that evidence a mark stays ``strict``: there is
+    no path that relaxes a gate on anything less than same-product evidence."""
     if sensitivity == "strict":
         return "strict"
     product = _PRODUCT_OF[key]
-    confirmed = key in provenance or any(_PRODUCT_OF[k] == product for k in strict_keys if k != key)
-    if confirmed:
-        return "confirmed"
-    return "assumed" if sensitivity == "assume_ai" else "strict"
+    confirmed = key in provenance or any(
+        _PRODUCT_OF[k] == product for k in strict_keys if k != key and k not in _CANNOT_CORROBORATE
+    )
+    return "confirmed" if confirmed else "strict"
 
 
-def _keep_pill(keys: set[str], *, provenance: frozenset[str], sensitivity: Sensitivity, footprint_flat: bool) -> bool:
+def _keep_pill(keys: set[str], *, provenance: frozenset[str], footprint_flat: bool) -> bool:
     """Whether to auto-remove the capture-less 'AI生成' pill given the fired marks.
 
     Pure decision (the flatness feature is precomputed at perception time and passed
@@ -522,11 +575,10 @@ def _keep_pill(keys: set[str], *, provenance: frozenset[str], sensitivity: Sensi
     its false fires were textured ceilings/walls that the fill visibly SMEARS. Arms:
       * bottom-right "★ 即梦AI" wordmark fired -> ~94% precise, and it survives
         metadata-STRIPPED uploads: remove the pill unrestricted;
-      * TC260 metadata confirms Jimeng (``"jimeng" in provenance``, no wordmark) OR the
-        caller asserts AI (``sensitivity == "assume_ai"``) -> remove ONLY when the
+      * TC260 metadata confirms Jimeng (``"jimeng" in provenance``, no wordmark) -> remove ONLY when the
         top-left footprint is flat enough for an invisible fill (``footprint_flat``),
         so real flat-scene pills (and harmless flat false fires) are cleaned while the
-        damaging textured false fires are left untouched even under assume_ai.
+        damaging textured false fires are left untouched.
     A Doubao image is TC260 too but is not Jimeng-basic, so the pill never rides on a
     Doubao detection. No confirmation at all -> never remove (blocks false fires on
     non-Jimeng content)."""
@@ -534,7 +586,7 @@ def _keep_pill(keys: set[str], *, provenance: frozenset[str], sensitivity: Sensi
         return False
     if "jimeng" in keys:
         return True
-    if "jimeng" in provenance or sensitivity == "assume_ai":
+    if "jimeng" in provenance:
         return footprint_flat
     return False
 
@@ -557,7 +609,7 @@ def _build_candidates(image: NDArray[Any]) -> list[Candidate]:
         strict = m.detect(image, provenance=False)
         relaxed = m.detect(image, provenance=True)
         feats = m.features(image) if (strict.detected or relaxed.detected) else {}
-        cands.append(Candidate(m.key, m.label, strict.detected, relaxed.detected, relaxed.confidence, feats))
+        cands.append(Candidate(m.key, m.label, strict.detected, relaxed.detected, feats))
     return cands
 
 
@@ -566,9 +618,8 @@ def decide(candidates: list[Candidate], context: Context) -> list[Decision]:
     ordered list of marks to remove (and the trust level each was accepted at).
 
     All policy lives here, in one place: per-mark trust resolution (:func:`resolve_trust`,
-    which needs the strict-detected siblings for ``auto`` cross-mark corroboration), the
-    assumed-trust confidence floor (:func:`assumed_floor_ok`) and the capture-less pill
-    gate (:func:`_keep_pill`). No image, no I/O -- so it is unit-testable in isolation and
+    which needs the strict-detected siblings for ``auto`` cross-mark corroboration) and
+    the capture-less pill gate (:func:`_keep_pill`). No image, no I/O -- so it is unit-testable in isolation and
     the same decision drives every caller."""
     strict_keys = {c.key for c in candidates if c.detected_strict}
     fired: list[Decision] = []
@@ -578,23 +629,13 @@ def decide(candidates: list[Candidate], context: Context) -> list[Decision]:
         )
         relax = trust != "strict"
         ok = c.detected_relaxed if relax else c.detected_strict
-        if trust == "assumed" and not assumed_floor_ok(c.key, c.relaxed_confidence):
-            # Relaxed on assumption alone and too weak to trust: fall back to the strict
-            # verdict rather than dropping the mark, so assume_ai is monotonic -- it only
-            # ever ADDS recall over strict, never removes less than strict would.
-            ok, relax = c.detected_strict, False
         if ok:
             fired.append(Decision(c, relax))
     keys = {d.candidate.key for d in fired}
     if "jimeng_pill" in keys:
         pill = next(d for d in fired if d.candidate.key == "jimeng_pill")
         flat = bool(pill.candidate.features.get("footprint_flat", 0.0))
-        if not _keep_pill(
-            keys,
-            provenance=context.provenance,
-            sensitivity=context.sensitivity,
-            footprint_flat=flat,
-        ):
+        if not _keep_pill(keys, provenance=context.provenance, footprint_flat=flat):
             fired = [d for d in fired if d.candidate.key != "jimeng_pill"]
     return fired
 

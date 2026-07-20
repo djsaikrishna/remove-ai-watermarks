@@ -49,6 +49,7 @@ from remove_ai_watermarks.noai.watermark_profiles import (
     QWEN_MODEL_ID,
     normalize_profile,
     resolve_strength,
+    viable_steps,
 )
 
 logger = logging.getLogger(__name__)
@@ -689,6 +690,20 @@ class WatermarkRemover:
         if seed is not None and _HAS_TORCH:
             self._set_progress(f"Setting reproducible seed: {seed}")
             generator = _make_seed_generator(self.device, seed)
+
+        # A step count whose product with strength rounds to zero kills the pipeline
+        # inside attention with an opaque reshape error, so raise it to the minimum that
+        # denoises. Must be applied to the value HANDED TO THE PIPELINE -- the old
+        # max(1, ...) below only clamped the number in the log line.
+        adjusted = viable_steps(num_inference_steps, strength)
+        if adjusted != num_inference_steps:
+            logger.warning(
+                "steps=%s at strength=%s denoises 0 steps and would crash; using steps=%s (1 effective)",
+                num_inference_steps,
+                strength,
+                adjusted,
+            )
+            num_inference_steps = adjusted
 
         effective_steps = max(1, int(num_inference_steps * strength))
         self._set_progress(

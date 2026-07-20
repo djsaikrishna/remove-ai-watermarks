@@ -8,7 +8,7 @@ up metadata provenance, or preserve the alpha channel by hand:
     import remove_ai_watermarks as raiw
     raiw.remove_visible("in.png", "out.png")                 # path -> file, provenance auto
     result, removed = raiw.remove_visible(bgr_array)         # array -> array
-    raiw.remove_visible("shot.png", "out.png", sensitivity="assume_ai")
+    raiw.remove_visible("shot.png", "out.png", sensitivity="strict")
     raiw.visible_provenance("in.png")                        # -> frozenset({"gemini"})
 
 Imports stay lazy (inside the functions), so ``import remove_ai_watermarks`` is cheap.
@@ -134,10 +134,8 @@ def remove_visible(
     array is always returned as well, so an empty ``removed`` list tells a caller nothing
     known was found (e.g. route to the diffusion ``all`` path or ``erase``).
 
-    ``sensitivity`` (``auto``/``strict``/``assume_ai``) and ``backend``
+    ``sensitivity`` (``auto``/``strict``) and ``backend``
     (``auto``/``cv2``/``migan``/``lama``) are the same knobs as the CLI. Pass
-    ``sensitivity="assume_ai"`` for a metadata-stripped screenshot the caller knows is
-    AI-generated (best recall, at the cost of a small near-lossless fill on a clean
     corner if the guess is wrong).
 
     ``strip_metadata`` (default True, matching the CLI ``visible --strip-metadata``)
@@ -152,6 +150,9 @@ def remove_visible(
     """
     from remove_ai_watermarks import watermark_registry
 
+    # Reject a removed sensitivity loudly; `Sensitivity` is a Literal and not enforced
+    # at runtime, so a 0.15 caller would otherwise get `auto` behaviour in silence.
+    watermark_registry.validate_sensitivity(sensitivity)
     loaded = _load_visible_input(source)
     result, removed = watermark_registry.remove_auto_marks(
         loaded.bgr,

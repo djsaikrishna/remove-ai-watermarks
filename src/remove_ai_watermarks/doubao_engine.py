@@ -47,7 +47,21 @@ TOPHAT_DELTA = 12  # glyph must exceed the local background by this many levels
 # Shape-consistent detection: match the bundled alpha glyph silhouette against the
 # corner candidate via TM_CCOEFF_NORMED (keys on glyph SHAPE, not coverage; #23).
 DETECT_MIN_COVERAGE = 0.04
-DETECT_NCC_THRESHOLD = 0.4
+# NOTE: this gate is FRONT-END SPECIFIC. The continuous top-hat front-end scores higher
+# overall than the binary one (mean 0.809 vs 0.723 on the same 90 positives), so the
+# binary-era 0.40 left the provenance-relaxed gate (x0.7) far too low and admitted false
+# fires. Calibrated on the 240-image unbiased recall sample, full auto path:
+#
+#   gate   relaxed   recall   precision   true   false
+#   0.40     0.280      96%         91%     86       8
+#   0.45     0.315      94%         93%     85       6
+#   0.50     0.350      92%         99%     83       1   <- chosen
+#   0.60     0.420      87%         99%     78       1
+#
+# 0.50 beats the binary front-end on recall (92% vs 89%) at identical precision (99%),
+# which is the only reason the front-end switch is worth it. Do not port this number to
+# a binary-front-end mark; re-calibrate per front-end.
+DETECT_NCC_THRESHOLD = 0.50
 
 # Detection-silhouette geometry, emitted by scripts/visible_alpha_solve.py at the
 # captured width. Sizes the glyph silhouette for the TM_CCOEFF_NORMED detection match
@@ -71,6 +85,12 @@ _CONFIG = TextMarkConfig(
     morph_open_size=5,
     detect_min_coverage=DETECT_MIN_COVERAGE,
     detect_ncc_threshold=DETECT_NCC_THRESHOLD,
+    detect_frontend="tophat",
+    scale_basis="short",  # measured: recovers 56% of landscape misses (see scale_base)
+    # No rival margin: measured 2026-07-18, the symmetric gate cost Doubao 7 genuine
+    # detections to prevent 5 false ones (1.4:1 against). Doubao's absolute detector
+    # is already 86% precise, so it has nothing to buy; Jimeng's is 38% and gains 25pp
+    # for free. The confusion is asymmetric, so the remedy is too.
     alpha_width_frac=_ALPHA_WIDTH_FRAC,
     alpha_height_frac=_ALPHA_HEIGHT_FRAC,
     min_gw=8,
@@ -90,9 +110,9 @@ def _glyph_silhouette() -> NDArray[Any] | None:
     return _text_mark_engine.glyph_silhouette(_CONFIG.asset_name)
 
 
-def _template_match_score(box_mask: NDArray[Any], image_width: int) -> float:
+def _template_match_score(box_mask: NDArray[Any], scale_base: int) -> float:
     """TM_CCOEFF_NORMED of the Doubao glyph silhouette against ``box_mask``."""
-    return _text_mark_engine.template_match_score(box_mask, image_width, _CONFIG)
+    return _text_mark_engine.template_match_score(box_mask, scale_base, _CONFIG)
 
 
 class DoubaoEngine(TextMarkEngine):

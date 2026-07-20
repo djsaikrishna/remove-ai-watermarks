@@ -42,8 +42,20 @@ TOPHAT_DELTA = 12
 
 # Shape-consistent detection. Threshold 0.45 cleanly separates real Jimeng marks
 # (>=0.81) from the Doubao strip (0.21), so the two ByteDance marks do not cross-fire.
+#
+# That separation holds at the STRICT threshold ONLY. Relaxed under provenance it
+# collapses: at the old shared 0.7 factor (gate 0.315) the arm ran at 17% precision
+# and 33 of its 68 false additions were Doubao marks (corpus-measured 2026-07-18 --
+# full table at _DEFAULT_PROVENANCE_NCC_FACTOR). That was patched with a tighter 0.85
+# factor at the time; the competitive rival margin replaced it -- see below.
 DETECT_MIN_COVERAGE = 0.02
 DETECT_NCC_THRESHOLD = 0.45
+
+# Back to the 0.70 default. The 0.85 patch (2026-07-18) existed only to blunt the
+# Doubao cross-fire by sacrificing recall; the competitive RIVAL MARGIN below
+# discriminates directly and passes real wordmarks at 100%, so the recall the patch
+# gave up is no longer the price of precision. See _rival_margin_ok.
+PROVENANCE_NCC_FACTOR = 0.7
 
 # Detection-silhouette geometry, emitted by scripts/visible_alpha_solve.py from the
 # gray capture at the captured width (sizes the silhouette for the detection match;
@@ -67,6 +79,8 @@ _CONFIG = TextMarkConfig(
     morph_open_size=5,
     detect_min_coverage=DETECT_MIN_COVERAGE,
     detect_ncc_threshold=DETECT_NCC_THRESHOLD,
+    provenance_ncc_factor=PROVENANCE_NCC_FACTOR,
+    rivals=("doubao_alpha.png",),
     alpha_width_frac=_ALPHA_WIDTH_FRAC,
     alpha_height_frac=_ALPHA_HEIGHT_FRAC,
     min_gw=8,
@@ -85,9 +99,9 @@ def _glyph_silhouette() -> NDArray[Any] | None:
     return _text_mark_engine.glyph_silhouette(_CONFIG.asset_name)
 
 
-def _template_match_score(box_mask: NDArray[Any], image_width: int) -> float:
+def _template_match_score(box_mask: NDArray[Any], scale_base: int) -> float:
     """TM_CCOEFF_NORMED of the Jimeng glyph silhouette against ``box_mask``."""
-    return _text_mark_engine.template_match_score(box_mask, image_width, _CONFIG)
+    return _text_mark_engine.template_match_score(box_mask, scale_base, _CONFIG)
 
 
 class JimengEngine(TextMarkEngine):

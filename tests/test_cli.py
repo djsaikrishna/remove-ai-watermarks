@@ -573,6 +573,31 @@ class TestMetadataCommand:
         assert result.exit_code == 0
         assert "stripped" in result.output
 
+    def test_metadata_remove_reports_failure_when_the_strip_was_a_no_op(self, runner, tmp_path):
+        """A file PIL cannot decode is copied through UNCHANGED by the fail-safe.
+
+        That is correct (never crash a worker on a partial upload) but the command used
+        to print "AI metadata stripped ->" and exit 0 for it, so a caller could not tell
+        a real strip from a no-op and the output still read as AI. Found on real Samsung
+        Galaxy S22 C2PA PNGs during the corpus parity audit, 2026-07-19.
+        """
+        # PNG signature + a C2PA (caBX) chunk, then garbage: the byte scanner sees the
+        # marker, PIL cannot decode it.
+        src = tmp_path / "undecodable.png"
+        payload = b"c2pa" + b"\x00" * 32
+        chunk = len(payload).to_bytes(4, "big") + b"caBX" + payload + b"\x00\x00\x00\x00"
+        src.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk + b"NOTAPNG" * 8)
+        out = tmp_path / "cleaned.png"
+
+        result = runner.invoke(main, ["metadata", str(src), "--remove", "-o", str(out)])
+
+        from remove_ai_watermarks.metadata import get_ai_metadata
+
+        if not get_ai_metadata(src):
+            pytest.skip("fixture does not register as an AI-metadata carrier")
+        assert result.exit_code != 0, "a no-op strip must not report success"
+        assert "stripped ->" not in result.output
+
     def test_metadata_remove_in_place(self, runner, tmp_png_with_ai_metadata):
         """With ``-o`` omitted, the strip overwrites the source in place (default
         output_path=None). Previously every test passed an explicit ``-o``."""

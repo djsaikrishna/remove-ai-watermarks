@@ -5,6 +5,7 @@ Pure configuration and lookup functions with no ML dependencies.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -135,6 +136,30 @@ def resolve_strength(strength: float | None, vendor: str | None = None, pipeline
     if pipeline is not None and normalize_profile(pipeline) == "qwen":
         return _QWEN_VENDOR_STRENGTH.get(vendor or "", QWEN_UNKNOWN_STRENGTH)
     return _VENDOR_STRENGTH.get(vendor or "", UNKNOWN_STRENGTH)
+
+
+def viable_steps(num_inference_steps: int, strength: float) -> int:
+    """The smallest step count >= ``num_inference_steps`` that actually denoises.
+
+    diffusers derives its img2img timesteps as ``int(steps * strength)``. When that
+    rounds to ZERO the pipeline builds an empty latent and dies deep inside attention
+    with ``cannot reshape tensor of 0 elements into shape [0, -1, 1, 512]`` -- an opaque
+    torch error for what is really "these two options cannot work together".
+
+    The combination is reachable with entirely valid CLI arguments: at the default
+    strength 0.15 every ``--steps`` below 7 crashed, and nothing told the user that
+    ``--steps`` and ``--strength`` interact (found by the release smoke matrix,
+    2026-07-19). Raising the count to the minimum that denoises keeps the caller's intent
+    -- they asked for "few steps", not "zero" -- and the engine logs the adjustment.
+
+    A non-positive ``strength`` cannot denoise at any step count; return the caller's
+    value unchanged rather than dividing by zero.
+    """
+    if strength <= 0:
+        return num_inference_steps
+    if int(num_inference_steps * strength) >= 1:
+        return num_inference_steps
+    return math.ceil(1 / strength)
 
 
 def vendor_for_strength(image_path: Path) -> Literal["openai", "google"] | None:

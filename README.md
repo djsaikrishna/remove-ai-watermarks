@@ -27,7 +27,7 @@ It does **not** target watermarks that protect someone else's paid or copyrighte
 
 ## Features
 
-- **Visible watermark removal** — a registry of known marks in their usual places: the Gemini / Nano Banana sparkle, the Doubao "豆包AI生成" text strip, the Jimeng "★ 即梦AI" wordmark, and the Samsung Galaxy AI "✦ Contenuti generati dall'AI" strip (bottom-left, locale-specific). Each mark is **localized to a footprint mask, then filled**: the engine finds the mark, builds a binary mask over its footprint, and one shared, swappable fill inpaints that region. Choose the fill with `--backend`: `cv2` (classical inpaint, no deps, the floor), `migan` (MI-GAN, light, the memory-tight pick where LaMa will not fit), or `lama` (big-LaMa, best quality, heavier, auto-preferred when a learned backend is available); the default `auto` uses LaMa > MI-GAN > cv2, best available. The localizer is cheap CPU (cv2/numpy), so it runs anywhere; the heavier MI-GAN/LaMa fill is opt-in. Detection keys on each mark's own shape (NCC against a captured silhouette; the alpha captures rebuilt by `scripts/visible_alpha_solve.py` are used to detect and to shape the mask, not for pixel recovery). The visual detector needs no metadata, but a borderline (faint or moved) mark is only trusted with corroboration: `--sensitivity` (default `auto`) relaxes a mark's gate when local metadata confirms the vendor or a same-product sibling mark is found; `--sensitivity assume-ai` relaxes every mark on the assertion that the image is AI, recovering the moved or re-rendered marks the conservative gate skips on a metadata-stripped screenshot (`strict` never relaxes). Because asserting "this is AI" says nothing about *which* vendor made it, a mark relaxed on that assertion alone still has to clear a confidence floor, so a clean photo is left untouched. `visible --mark auto` finds and removes every detected mark in one pass. Fast, offline, no GPU. (For arbitrary logos/objects, see `erase`.)
+- **Visible watermark removal** — a registry of known marks in their usual places: the Gemini / Nano Banana sparkle, the Doubao "豆包AI生成" text strip, the Jimeng "★ 即梦AI" wordmark, and the Samsung Galaxy AI "✦ Contenuti generati dall'AI" strip (bottom-left, locale-specific). Each mark is **localized to a footprint mask, then filled**: the engine finds the mark, builds a binary mask over its footprint, and one shared, swappable fill inpaints that region. Choose the fill with `--backend`: `cv2` (classical inpaint, no deps, the floor), `migan` (MI-GAN, light, the memory-tight pick where LaMa will not fit), or `lama` (big-LaMa, best quality, heavier, auto-preferred when a learned backend is available); the default `auto` uses LaMa > MI-GAN > cv2, best available. The localizer is cheap CPU (cv2/numpy), so it runs anywhere; the heavier MI-GAN/LaMa fill is opt-in. Detection keys on each mark's own shape (NCC against a captured silhouette; the alpha captures rebuilt by `scripts/visible_alpha_solve.py` are used to detect and to shape the mask, not for pixel recovery). The visual detector needs no metadata, but a borderline (faint or moved) mark is only trusted with corroboration: `--sensitivity` (default `auto`) relaxes a mark's gate when local metadata confirms the vendor or a same-product sibling mark is found; `strict` never relaxes. There is deliberately no "assume this is AI" mode: asserting that an image is AI says nothing about *which* vendor made it or *where* the mark is, which is exactly what a gate bypass needs. If you can SEE a mark the detector missed, point at it with `erase --region x,y,w,h`, or force a known text mark by name with `--mark <name> --no-detect` -- both act on what you actually see instead of relaxing every detector at once. `visible --mark auto` finds and removes every detected mark in one pass. Fast, offline, no GPU. (For arbitrary logos/objects, see `erase`.)
 - **Universal region eraser (`erase`)** — remove any logo / watermark / object inside boxes you specify, regardless of position or color. Default cv2 inpainting (CPU, instant); optional big-LaMa via onnxruntime (`lama` extra) for higher quality
 - **Invisible watermark removal** — SynthID, StableSignature, TreeRing via diffusion-based regeneration (needs a local GPU, or run it with no setup on [raiw.cc](https://raiw.cc))
 - **AI metadata stripping** — EXIF, PNG text chunks, C2PA provenance manifests (PNG / JPEG / AVIF / HEIF / JPEG-XL, **MP4 / MOV / M4V / M4A** at the container level, and **WebM / MP3 / WAV / FLAC / OGG** losslessly via ffmpeg), XMP DigitalSourceType
@@ -335,17 +335,17 @@ remove-ai-watermarks identify image.png
 # --mark gemini / doubao / jimeng / samsung. Removal localizes each mark to a
 # footprint mask and inpaints it with a shared fill; --backend auto|cv2|migan|lama
 # (default auto) picks the fill (auto = LaMa > MI-GAN > cv2, best available).
-# --sensitivity auto|strict|assume-ai (default auto) sets how hard a borderline
-# mark is trusted; use assume-ai on a metadata-stripped screenshot to recover a
-# moved or faint mark the conservative gate would skip.
+# --sensitivity auto|strict (default auto) sets how hard a borderline mark is
+# trusted; there is no "assume this is AI" mode -- to act on a mark you can see
+# but the detector missed, point at it with `erase --region` (below).
 # If no known visible mark is found, it writes no output and exits 2 (not 0),
 # pointing you to `all` (for an invisible/metadata mark) or `erase` (for an
 # arbitrary logo) instead of handing back the unchanged image.
 remove-ai-watermarks visible image.png -o clean.png
 
-# Metadata-stripped screenshot: assert it is AI to relax detection and recover
-# a moved/faint mark (a wrong guess just fills a small corner near-losslessly).
-remove-ai-watermarks visible screenshot.png --sensitivity assume-ai -o clean.png
+# Metadata-stripped screenshot where you can SEE the mark but detection missed it:
+# point at it. This executes what you see instead of relaxing every detector at once.
+remove-ai-watermarks erase screenshot.png --region 812,1180,190,44 -o clean.png
 
 # Erase arbitrary region(s) — universal, any logo/watermark/object, any position.
 # Default cv2 inpainting (CPU). --backend lama uses big-LaMa (extra 'lama').
@@ -409,7 +409,7 @@ clean, removed = raiw.remove_visible(cv2.imread("in.png"), backend="cv2")
 
 # Metadata-stripped screenshot you know is AI-generated: relax detection to recover a
 # moved or faint mark (a wrong guess just fills a small corner near-losslessly).
-raiw.remove_visible("screenshot.png", "clean.png", sensitivity="assume_ai")
+raiw.remove_visible("screenshot.png", "clean.png", sensitivity="strict")
 
 # What the file's metadata confirms (drives the default `auto` sensitivity):
 raiw.visible_provenance("in.png")   # e.g. frozenset({'gemini'})

@@ -1,8 +1,8 @@
 """Shared base for the visible text-mark detectors/localizers (localize -> fill).
 
 The Doubao "豆包AI生成", Jimeng "★ 即梦AI", and Samsung "✦ Contenuti generati
-dall'AI" marks are the SAME algorithm: anchor a bottom-corner box by width-relative
-geometry, extract the light low-saturation glyph candidate (white top-hat), detect
+dall'AI" marks are the SAME algorithm: anchor a bottom-corner box by geometry
+relative to the image's SHORT side, extract the light low-saturation glyph candidate (white top-hat), detect
 by matching the bundled alpha-glyph silhouette via ``TM_CCOEFF_NORMED``, and build a
 removal MASK from the glyph blob's bounding box (:meth:`footprint_mask`) for the
 shared fill (region_eraser). The mask is template-FREE -- the top-hat glyph bbox, not
@@ -54,10 +54,41 @@ _MIN_DETECT_SHORT_SIDE = 200
 
 # Provenance-confirmed NCC relaxation. When external metadata already confirms the
 # vendor (so the mark is present with high prior), a faint or slightly re-rendered
-# glyph that scores just below the standard NCC gate is still trusted. 0.7 recovers
-# the near-threshold marks without dropping so low that an unrelated corner texture
-# on a (provenance-confirmed) image would match -- the coverage gate still applies.
-_PROVENANCE_NCC_FACTOR = 0.7
+# glyph that scores just below the standard NCC gate is still trusted. The relaxed
+# gate is ``detect_ncc_threshold * provenance_ncc_factor``; the coverage gate still
+# applies on top.
+#
+# This used to be ONE shared 0.7 for every text mark. Measured 2026-07-18 on the
+# `auto` path (the default -- no flag, driven by TC260 metadata), it turned out to
+# mean two completely different things per mark. Blind hand-label of the ADDITIONS
+# (accepted with provenance, rejected without) over 4417 unique TC260 carriers,
+# two-sided control (labeller sensitivity 100%/96%, specificity 100%/100%):
+#
+#   mark     band            precision   95% CI     n
+#   doubao   whole arm             76%    61-87%    42
+#            [0.280,0.340)         58%    36-77%    19
+#            [0.340,0.400)         91%    73-98%    23
+#   jimeng   whole arm             17%    10-27%    82
+#            [0.315,0.383)         12%     6-22%    68
+#            [0.383,0.450)         43%    21-67%    14
+#
+# Doubao stays at 0.70: both its bands return more true marks than false fills, so
+# tightening would cost 11 genuine recoveries to prevent 8 false ones.
+#
+# Jimeng moves to 0.85. Its relaxed detector does not key on the "★ 即梦AI" wordmark
+# any more -- it keys on "some text in the bottom-right corner": of 68 false
+# additions, 33 were DOUBAO marks and 17 were other vendors' AI labels (千问, 百度,
+# 星绘, 抖音). 45 of those 68 fill a corner nothing else would touch (the other 23
+# are harmless -- doubao fires strictly there and fills the same box anyway). At
+# 0.85 the [0.315,0.383) band is dropped: 8 genuine recoveries lost, 60 false fills
+# prevented (7.5:1). A false fill is the worse error -- it destroys pixels AND makes
+# the caller report a removal that did not happen, while a miss leaves the image
+# untouched.
+#
+# NOTE: 0.85 is a patch on a detector problem, not a fix. Jimeng's silhouette is not
+# discriminative against Doubao's (same corner, same script, both ByteDance), and no
+# threshold repairs that -- it needs a better detection silhouette.
+_DEFAULT_PROVENANCE_NCC_FACTOR = 0.7
 
 
 @dataclass(frozen=True)
@@ -68,7 +99,7 @@ class TextMarkConfig:
     asset_name: str  # bundled alpha PNG under assets/ (e.g. "doubao_alpha.png")
     corner: Literal["br", "bl"]  # bottom-right (Doubao/Jimeng) or bottom-left (Samsung)
     margin_floor: int  # min margin in px for locate (4 for br marks, 2 for Samsung)
-    # locate geometry (fraction of image WIDTH)
+    # locate geometry (fraction of scale_base -- see scale_base())
     width_frac: float
     height_frac: float
     margin_x_frac: float  # right margin (br) or left margin (bl)
@@ -81,12 +112,31 @@ class TextMarkConfig:
     # detection
     detect_min_coverage: float
     detect_ncc_threshold: float
-    # alpha-map glyph geometry (fraction of WIDTH) emitted by
+    # alpha-map glyph geometry (fraction of scale_base) emitted by
     # scripts/visible_alpha_solve.py, sizing the detection silhouette for
     # template_match_score
     alpha_width_frac: float
     alpha_height_frac: float
     min_gw: int  # minimum glyph width for the template match (8 br, 16 Samsung)
+    # Asset names of RIVAL marks that occupy the same corner and can therefore be
+    # scored against the same glyph blob. Detection becomes COMPETITIVE: this mark's
+    # template must beat every rival's by `rival_margin`. See _rival_margin_ok.
+    # Detection front-end. "binary" thresholds the top-hat into a glyph blob and
+    # correlates a binary silhouette against it; "tophat" correlates the CONTINUOUS
+    # top-hat response against a soft template and never binarizes. See
+    # TextMarkEngine.tophat_response for the measurement that motivated the split.
+    detect_frontend: Literal["binary", "tophat"] = "binary"
+    # Gaussian sigma applied to the template in the "tophat" front-end (0 = none).
+    template_blur: float = 0.0
+    # Which image dimension the mark's size and margins scale with. VENDOR-SPECIFIC,
+    # measured, not assumed -- see TextMarkEngine.scale_base. "short" = min(h, w), "width" = w.
+    scale_basis: Literal["short", "width"] = "width"
+    rivals: tuple[str, ...] = ()
+    rival_margin: float = 0.10
+    # Multiplier applied to detect_ncc_threshold when provenance confirms the vendor.
+    # Per-mark, NOT shared: see _DEFAULT_PROVENANCE_NCC_FACTOR for the measured
+    # precision that forced the split. Last field so it can carry a default.
+    provenance_ncc_factor: float = _DEFAULT_PROVENANCE_NCC_FACTOR
 
 
 @dataclass
@@ -146,18 +196,49 @@ def glyph_silhouette(asset_name: str) -> NDArray[Any] | None:
     return _silhouette_cache[asset_name]
 
 
-def template_match_score(box_mask: NDArray[Any], image_width: int, config: TextMarkConfig) -> float:
+_RIVAL_MODULES = {
+    "doubao_alpha.png": "remove_ai_watermarks.doubao_engine",
+    "jimeng_alpha.png": "remove_ai_watermarks.jimeng_engine",
+    "samsung_alpha.png": "remove_ai_watermarks.samsung_engine",
+}
+
+
+def _rival_config(asset_name: str, fallback: TextMarkConfig) -> TextMarkConfig:
+    """The rival mark's own config, for scoring its template on a shared blob.
+
+    Looked up LAZILY by asset name: a rival's template geometry
+    (``alpha_*_frac`` / ``min_gw``) is its own, and scoring it with this mark's
+    geometry would compare a correctly-sized template against a mis-sized one and
+    hand the margin a free win. Lazy because the engine modules import this one.
+    """
+    mod_path = _RIVAL_MODULES.get(asset_name)
+    if mod_path is None:
+        return fallback
+    from importlib import import_module
+
+    try:
+        return import_module(mod_path)._CONFIG
+    except Exception:  # a missing/renamed engine must not break detection
+        logger.debug("rival config %s unavailable; skipping its margin check.", asset_name)
+        return fallback
+
+
+def template_match_score(box_mask: NDArray[Any], scale_base: int, config: TextMarkConfig) -> float:
     """Zero-mean normalized correlation of the alpha-template glyph silhouette
     (scaled to the mark's expected size) against the candidate ``box_mask``.
 
     ``TM_CCOEFF_NORMED`` keys on glyph SHAPE, not coverage, so a dense textured
     corner does not score highly -- only the actual glyph shape does.
+
+    ``scale_base`` is the mark's own scaling dimension (:meth:`TextMarkEngine.scale_base`),
+    not always the width: sizing the template on the wrong basis stretches it by the
+    aspect ratio on landscape inputs and the correlation collapses.
     """
     sil = glyph_silhouette(config.asset_name)
     if sil is None or box_mask.size == 0:
         return 0.0
-    gw = min(box_mask.shape[1] - 1, max(config.min_gw, int(config.alpha_width_frac * image_width)))
-    gh = min(box_mask.shape[0] - 1, max(4, int(config.alpha_height_frac * image_width)))
+    gw = min(box_mask.shape[1] - 1, max(config.min_gw, int(config.alpha_width_frac * scale_base)))
+    gh = min(box_mask.shape[0] - 1, max(4, int(config.alpha_height_frac * scale_base)))
     if gw < config.min_gw or gh < 4:
         return 0.0
     template = cv2.resize(sil, (gw, gh), interpolation=cv2.INTER_NEAREST)
@@ -178,19 +259,153 @@ class TextMarkEngine:
     def _glyph_silhouette(self) -> NDArray[Any] | None:
         return glyph_silhouette(self.config.asset_name)
 
-    def _template_match_score(self, box_mask: NDArray[Any], image_width: int) -> float:
-        return template_match_score(box_mask, image_width, self.config)
+    def _template_match_score(self, box_mask: NDArray[Any], scale_base: int) -> float:
+        return template_match_score(box_mask, scale_base, self.config)
+
+    def _rival_margin_ok(self, score: float, box_mask: NDArray[Any], scale_base: int) -> bool:
+        """Whether this mark's template beats every same-corner RIVAL's on the SAME blob.
+
+        Detection was purely ABSOLUTE -- each engine scored its own template and
+        compared against its own threshold, so nothing ever asked the discriminative
+        question "does this blob look more like the neighbour's mark than like mine?".
+        Two marks sharing a corner and a script (Doubao "豆包AI生成" and Jimeng
+        "★ 即梦AI", both bottom-right, both near-white CJK) survive binarization into
+        very similar blobs, so an absolute gate cannot separate them -- and under the
+        provenance relaxation it stopped trying: 33 of jimeng's 68 false additions
+        were Doubao marks (corpus-measured 2026-07-18).
+
+        Measured separability on hand-labelled examples, scoring BOTH templates
+        against the same glyph blob (n=40 jimeng / 75 doubao / 20 other-vendor labels
+        / 89 clean):
+
+            feature                       separability   (0.5 = useless, 1.0 = perfect)
+            absolute ncc_jimeng                   0.96
+            ncc_jimeng MINUS ncc_doubao           0.99
+
+        At a 0.10 margin: real Jimeng wordmarks pass 100%, Doubao strips 8%, other
+        vendors' AI labels (千问/百度/星绘/抖音) 55%, no-mark corners 12%. Because the
+        real marks pass at 100%, this costs NO recall -- it is a pure precision gain,
+        unlike raising the threshold, which trades recall away.
+
+        Marks with no same-corner rival declare `rivals=()` and are unaffected.
+        """
+        c = self.config
+        if not c.rivals:
+            return True
+        for rival_asset in c.rivals:
+            rival = _rival_config(rival_asset, c)
+            if score - template_match_score(box_mask, scale_base, rival) < c.rival_margin:
+                logger.debug("%s detect: loses the %s rival margin; rejecting.", c.name, rival_asset)
+                return False
+        return True
 
     # ── Locate ──────────────────────────────────────────────────────────
 
+    def tophat_response(self, image: NDArray[Any], loc: TextMarkLocation) -> NDArray[Any] | None:
+        """The CONTINUOUS white top-hat in the located box -- the glyph signal, unbinarized.
+
+        :meth:`extract_mask` thresholds this same response into a 0/255 glyph blob. That
+        is fine for a mark stamped bold and opaque, and destructive for a faint one: a
+        thin translucent overlay shatters into specks under the threshold, and no
+        template can match a blob that is not there.
+
+        Measured 2026-07-18 on hand-verified corpus positives (40 doubao, 14 千问, 60
+        verified-clean), scoring each mark with its own template:
+
+            front-end   doubao   clean neg   AUC doubao/neg
+            binary       0.723       ~0.12             --
+            tophat       0.781        0.122          1.00
+
+        The gates that were hard cuts in the binary path (saturation, absolute luma)
+        become WEIGHTS here, so a faint stroke contributes in proportion to its strength
+        instead of being dropped at a threshold. The response is max-normalized, which
+        makes the score contrast-invariant -- the point of the exercise.
+
+        Kept per-mark (``detect_frontend``) rather than switched globally, because a
+        front-end change must be measured per mark before it ships.
+        """
+        c = self.config
+        x, y, bw, bh = loc.bbox
+        if bh < 16 or bw < 16:
+            return None
+        roi = image_io.to_bgr(image[y : y + bh, x : x + bw]).astype(np.float32)
+        luma = roi.mean(axis=2)
+        sat = roi.max(axis=2) - roi.min(axis=2)
+        sigma = max(4.0, bh * 0.4)
+        tophat = luma - cv2.GaussianBlur(luma, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        resp = np.clip(tophat, 0, None) * (sat < c.max_saturation)
+        peak = float(resp.max())
+        if peak <= 1e-6:
+            return None
+        return (resp / peak * 255).astype(np.uint8)
+
+    def _tophat_score(self, image: NDArray[Any], loc: TextMarkLocation) -> float:
+        """TM_CCOEFF_NORMED of a soft template against the continuous response.
+
+        Sweeps a small scale band: the nominal glyph size is derived from the mark's
+        geometry, but a vendor re-rasterization shifts it by a few percent and the
+        continuous response is sharp enough that an exact-size template would miss.
+        """
+        c = self.config
+        resp = self.tophat_response(image, loc)
+        sil = self._glyph_silhouette()
+        if resp is None or sil is None:
+            return 0.0
+        base = self.scale_base(image)
+        best = 0.0
+        for scale in (0.8, 1.0, 1.25):
+            gw = max(c.min_gw, int(c.alpha_width_frac * base * scale))
+            gh = max(4, int(c.alpha_height_frac * base * scale))
+            if gw >= resp.shape[1] or gh >= resp.shape[0]:
+                continue
+            tmpl = cv2.resize(sil, (gw, gh), interpolation=cv2.INTER_AREA).astype(np.float32)
+            if c.template_blur > 0:
+                tmpl = cv2.GaussianBlur(tmpl, (0, 0), sigmaX=c.template_blur, sigmaY=c.template_blur)
+            best = max(best, float(cv2.matchTemplate(resp, tmpl.astype(np.uint8), cv2.TM_CCOEFF_NORMED).max()))
+        return best
+
+    def scale_base(self, image: NDArray[Any]) -> int:
+        """The image dimension this mark's geometry scales with.
+
+        Per-mark, and MEASURED -- a single shared basis is wrong. The tuned fractions
+        were all calibrated on PORTRAIT captures, where width and short side coincide,
+        so the basis was never exercised until landscape inputs were measured.
+
+        Corpus-measured 2026-07-18 (2572 unique TC260 carriers; the harness is
+        `scripts/visible_eval.py`). Before any fix, doubao detection by aspect ratio:
+        portrait 60%, square 41%, **landscape 0% (0 of 435)** -- the width-scaled box
+        is inflated by the aspect ratio on a wide image and the glyph never lands in
+        it. Re-running the previously-undetected set with a short-side basis recovered
+        **56% of landscape** images (12% square, 4% portrait).
+
+        But the same switch took JIMENG's labelled landscape positives from 13/13 to
+        0/13: its wordmark tracks the WIDTH. Both marks are ByteDance and share a
+        corner, and they still scale differently -- so this is a per-mark measurement,
+        not a house rule to generalize. Samsung keeps ``width`` because there is no
+        corpus evidence either way (1 addition corpus-wide) and an unmeasured change
+        is not an improvement.
+
+        China's GB 45438-2025 clause 5.2(e) mandates glyph height >= 5% of "the
+        shortest side" for CN marks, which is why a short-side basis is the natural
+        prior -- but Jimeng's measured behaviour overrides the prior, and measurement
+        wins over the standard's wording.
+        """
+        return min(image.shape[:2]) if self.config.scale_basis == "short" else image.shape[1]
+
     def locate(self, image: NDArray[Any]) -> TextMarkLocation:
-        """Anchor the watermark box in the configured bottom corner by geometry."""
+        """Anchor the watermark box in the configured corner, scaled by ``scale_basis``.
+
+        Every fraction is taken against ``scale_base(image)`` -- see
+        :data:`TextMarkConfig.scale_basis`, which is per-mark because the vendors
+        genuinely differ.
+        """
         c = self.config
         h, w = image.shape[:2]
-        wm_w = max(40, int(w * c.width_frac))
-        wm_h = max(16, int(w * c.height_frac))
-        margin_x = max(c.margin_floor, int(w * c.margin_x_frac))
-        margin_b = max(c.margin_floor, int(w * c.margin_bottom_frac))
+        base = self.scale_base(image)
+        wm_w = max(40, int(base * c.width_frac))
+        wm_h = max(16, int(base * c.height_frac))
+        margin_x = max(c.margin_floor, int(base * c.margin_x_frac))
+        margin_b = max(c.margin_floor, int(base * c.margin_bottom_frac))
         x = max(0, w - margin_x - wm_w) if c.corner == "br" else min(margin_x, max(0, w - wm_w))
         y = max(0, h - margin_b - wm_h)
         wm_w = min(wm_w, w - x)
@@ -251,7 +466,8 @@ class TextMarkEngine:
         (China-AIGC / byteimg for Doubao/Jimeng, ``samsung_genai`` for Samsung); the
         NCC gate exists to keep a corner texture on an UNRELATED image from matching
         the glyph silhouette, so when provenance confirms the vendor it is relaxed by
-        ``_PROVENANCE_NCC_FACTOR`` to recover a faint or slightly re-rendered mark.
+        the mark's own ``provenance_ncc_factor`` to recover a faint or slightly
+        re-rendered mark (per-mark, not shared -- see _DEFAULT_PROVENANCE_NCC_FACTOR).
         """
         c = self.config
         det = TextMarkDetection()
@@ -274,11 +490,20 @@ class TextMarkEngine:
         coverage = float((box > 0).sum()) / float(max(1, bw * bh))
         det.region = loc.bbox
         det.coverage = coverage
-        if coverage >= c.detect_min_coverage:
-            score = self._template_match_score(box, image.shape[1])
-            threshold = c.detect_ncc_threshold * (_PROVENANCE_NCC_FACTOR if provenance else 1.0)
+        if c.detect_frontend == "tophat":
+            # The continuous front-end does not depend on the binarized blob, so the
+            # coverage gate (a blob-area heuristic) does not apply to it.
+            score = self._tophat_score(image, loc)
+            threshold = c.detect_ncc_threshold * (c.provenance_ncc_factor if provenance else 1.0)
             det.confidence = score
-            det.detected = score >= threshold
+            det.detected = score >= threshold and self._rival_margin_ok(score, box, self.scale_base(image))
+            logger.debug("%s detect (tophat): ncc=%.2f thr=%.2f detected=%s", c.name, score, threshold, det.detected)
+            return det
+        if coverage >= c.detect_min_coverage:
+            score = self._template_match_score(box, self.scale_base(image))
+            threshold = c.detect_ncc_threshold * (c.provenance_ncc_factor if provenance else 1.0)
+            det.confidence = score
+            det.detected = score >= threshold and self._rival_margin_ok(score, box, self.scale_base(image))
             logger.debug(
                 "%s detect: coverage=%.3f ncc=%.2f thr=%.2f detected=%s",
                 c.name,

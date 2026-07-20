@@ -113,23 +113,50 @@ class TestFill:
 
 
 class TestProvenanceGate:
-    """The Gemini trust gate relaxes from 0.5 to 0.35 when provenance confirms Google;
-    tested deterministically by stubbing the engine's raw detection confidence."""
+    """The Gemini trust gate relaxes from GEMINI_SPARKLE_TRUST_CONF to
+    _GEMINI_PROVENANCE_MIN_CONF when provenance confirms Google; tested
+    deterministically by stubbing the engine's raw detection confidence."""
 
     def _stub(self, monkeypatch: pytest.MonkeyPatch, conf: float) -> None:
         from remove_ai_watermarks.gemini_engine import DetectionResult
 
+        # `detected` mirrors the engine's own internal floor (0.35), which is
+        # independent of the registry gate under test here.
         def fake_detect(image, force_size=None, *, trust_provenance=False):
             return DetectionResult(detected=conf >= 0.35, confidence=conf, region=(10, 10, 48, 48))
 
         monkeypatch.setattr(reg._engine("gemini"), "detect_watermark", fake_detect)
 
     def test_midband_conf_needs_provenance(self, monkeypatch: pytest.MonkeyPatch):
-        # conf 0.42 sits in [0.35, 0.5): demoted without provenance, trusted with it.
-        self._stub(monkeypatch, 0.42)
+        # Comfortably inside the relaxed band: demoted without provenance, trusted with it.
+        conf = (reg._GEMINI_PROVENANCE_MIN_CONF + reg.GEMINI_SPARKLE_TRUST_CONF) / 2
+        self._stub(monkeypatch, conf)
         img = np.zeros((256, 256, 3), np.uint8)
         assert reg.get_mark("gemini").detect(img).detected is False
         assert reg.get_mark("gemini").detect(img, provenance=True).detected is True
+
+    def test_below_provenance_gate_rejected_even_with_provenance(self, monkeypatch: pytest.MonkeyPatch):
+        """Provenance relaxes the gate, it does not remove it.
+
+        Guards the 2026-07-18 raise of _GEMINI_PROVENANCE_MIN_CONF (0.35 -> 0.42).
+        The engine still reports `detected` down at its own 0.35 floor, so without
+        the registry gate this confidence would be accepted and inpainted. Measured
+        precision just below the gate was 13% (n=30, 95% CI 5-30%) on real
+        Google-metadata uploads -- i.e. ~7 of 8 accepts there destroy pixels on an
+        image that never carried a sparkle, and report a removal that did not happen.
+        """
+        # 0.38 is inside the measured 13%-precision band and above the engine's own
+        # 0.35 floor, so the engine reports `detected` and only the registry gate can
+        # reject it. Hardcoded on purpose: if the gate is ever lowered back under this
+        # value, this test must fail on the BEHAVIOUR below, not on its own arithmetic.
+        self._stub(monkeypatch, 0.38)
+        img = np.zeros((256, 256, 3), np.uint8)
+        assert reg.get_mark("gemini").detect(img).detected is False
+        assert reg.get_mark("gemini").detect(img, provenance=True).detected is False
+
+    def test_provenance_gate_stays_below_the_strict_gate(self):
+        """The relaxed gate must actually relax, and must not collapse onto the floor."""
+        assert 0.35 < reg._GEMINI_PROVENANCE_MIN_CONF < reg.GEMINI_SPARKLE_TRUST_CONF
 
     def test_high_conf_detected_either_way(self, monkeypatch: pytest.MonkeyPatch):
         self._stub(monkeypatch, 0.72)
@@ -175,19 +202,6 @@ class TestSensitivity:
             == "strict"
         )
 
-    def test_assume_ai_without_evidence_is_assumed_not_confirmed(self):
-        # asserting the image is AI says nothing about WHICH vendor made it, so the mark
-        # is relaxed on assumption only -- it must not inherit the confirmed-vendor bypass
-        assert (
-            reg.resolve_trust("gemini", sensitivity="assume_ai", provenance=frozenset(), strict_keys=set()) == "assumed"
-        )
-
-    def test_assume_ai_with_metadata_is_confirmed(self):
-        assert (
-            reg.resolve_trust("gemini", sensitivity="assume_ai", provenance=frozenset({"gemini"}), strict_keys=set())
-            == "confirmed"
-        )
-
     def test_auto_relaxes_on_own_metadata(self):
         assert (
             reg.resolve_trust("gemini", sensitivity="auto", provenance=frozenset({"gemini"}), strict_keys=set())
@@ -210,21 +224,63 @@ class TestSensitivity:
             reg.resolve_trust("doubao", sensitivity="auto", provenance=frozenset(), strict_keys={"jimeng"}) == "strict"
         )
 
-    def test_assumed_floor_rejects_weak_sparkle_but_passes_strong(self):
-        # the gate-bypassed sparkle detector fires on ~60% of ordinary photos at its bare
-        # 0.35 threshold; only a match well clear of that floor is trustworthy on assumption
-        assert reg.assumed_floor_ok("gemini", 0.35) is False
-        assert reg.assumed_floor_ok("gemini", 0.50) is True
-
-    def test_assumed_floor_default_passes_for_unfloored_marks(self):
-        # text marks relax cleanly (<1% bypassed false-fire), so they carry no floor
-        assert reg.assumed_floor_ok("doubao", 0.36) is True
-
     def test_remove_auto_marks_accepts_all_sensitivities(self):
         blank = np.zeros((256, 256, 3), np.uint8)
-        for s in ("auto", "strict", "assume_ai"):
+        for s in ("auto", "strict"):
             _, removed = reg.remove_auto_marks(blank, sensitivity=s, backend="cv2")
             assert removed == []
+
+
+class TestNoBlanketRelaxation:
+    """There is NO path that relaxes a mark's gate without same-product evidence.
+
+    ``assume_ai`` was that path and was removed 2026-07-19: it bypassed every mark's
+    false-positive gate on the caller's bare assertion that the image is AI, which says
+    nothing about WHICH vendor or WHERE -- exactly what the bypass is contracted to
+    require. Before it carried a confidence floor it filled a phantom sparkle on 59.8%
+    of genuine camera photos. A user who can SEE a mark is served by `erase --region`
+    (they supply the coordinates) or `--mark <name> --no-detect` for a text mark.
+    """
+
+    def test_sensitivity_has_exactly_two_levels(self):
+        import typing
+
+        assert set(typing.get_args(reg.Sensitivity)) == {"auto", "strict"}
+
+    def test_trust_ladder_has_no_assumed_level(self):
+        import typing
+
+        assert set(typing.get_args(reg.Trust)) == {"strict", "confirmed"}
+
+    def test_no_sensitivity_relaxes_without_same_product_evidence(self):
+        for sens in ("auto", "strict"):
+            assert reg.resolve_trust("gemini", sensitivity=sens, provenance=frozenset(), strict_keys=set()) == "strict"
+
+    def test_the_assumed_floor_helper_is_gone(self):
+        """It existed only to make the blanket relaxation tolerable."""
+        assert not hasattr(reg, "assumed_floor_ok")
+        assert not hasattr(reg, "_ASSUMED_CONF_FLOOR")
+
+    def test_the_removed_value_raises_instead_of_silently_meaning_auto(self):
+        """`Sensitivity` is a Literal and unenforced at runtime, so a 0.15 caller passing
+        the removed value would quietly get `auto` -- a silent semantic change on exactly
+        the release where they need to be told. The error names the replacement."""
+        import pytest
+
+        with pytest.raises(ValueError, match="erase"):
+            reg.validate_sensitivity("assume_ai")
+        with pytest.raises(ValueError, match="unknown sensitivity"):
+            reg.validate_sensitivity("aggressive")
+        assert reg.validate_sensitivity("auto") == "auto"
+        assert reg.validate_sensitivity("strict") == "strict"
+
+    def test_context_rejects_it_too(self):
+        """The arbiter's own entry point validates, so a direct `decide()` caller cannot
+        smuggle the removed mode past the public API."""
+        import pytest
+
+        with pytest.raises(ValueError, match=r"removed in 0\.16"):
+            reg.Context(sensitivity="assume_ai")
 
 
 class TestArbiter:
@@ -233,11 +289,9 @@ class TestArbiter:
     Candidates -- this is the payoff of separating decision from perception."""
 
     @staticmethod
-    def _c(key, *, strict=False, relaxed=False, flat=False, relaxed_conf=1.0):
-        # relaxed_conf defaults high so a test that does not care about the assumed-trust
-        # confidence floor exercises the trust logic, not the floor.
+    def _c(key, *, strict=False, relaxed=False, flat=False):
         feats = {"footprint_flat": 1.0} if flat else {}
-        return reg.Candidate(key, f"L:{key}", strict, relaxed, relaxed_conf, feats)
+        return reg.Candidate(key, f"L:{key}", strict, relaxed, feats)
 
     def _keys(self, cands, ctx):
         return {d.candidate.key for d in reg.decide(cands, ctx)}
@@ -248,35 +302,6 @@ class TestArbiter:
     def test_strict_uses_strict_verdict(self):
         # relaxed-only detection must NOT fire under strict
         assert self._keys([self._c("gemini", relaxed=True)], reg.Context(sensitivity="strict")) == set()
-
-    def test_assume_ai_uses_relaxed(self):
-        fired = reg.decide([self._c("gemini", relaxed=True)], reg.Context(sensitivity="assume_ai"))
-        assert [d.candidate.key for d in fired] == ["gemini"]
-        assert fired[0].relax is True
-
-    def test_assume_ai_drops_sparkle_below_the_assumed_floor(self):
-        # REGRESSION (2026-07-16): assume_ai passed trust_provenance=True to the engine,
-        # bypassing the sparkle false-positive gate on the mere ASSERTION that the image is
-        # AI -- but that flag is contracted to mean "metadata proved this vendor". The bare
-        # bypassed gate (conf 0.35) fired on 59.8% of 256 genuine camera captures, so
-        # `--sensitivity assume-ai` filled a phantom sparkle on ~6 of every 10 clean photos.
-        weak = self._c("gemini", relaxed=True, relaxed_conf=0.40)
-        assert reg.decide([weak], reg.Context(sensitivity="assume_ai")) == []
-
-    def test_assume_ai_keeps_sparkle_confirmed_by_metadata_below_the_floor(self):
-        # the floor exists because the vendor is UNKNOWN; once metadata names Google the
-        # bypass is contract-legal again, so a weak match is still trusted
-        weak = self._c("gemini", relaxed=True, relaxed_conf=0.40)
-        ctx = reg.Context(sensitivity="assume_ai", provenance=frozenset({"gemini"}))
-        assert [d.candidate.key for d in reg.decide([weak], ctx)] == ["gemini"]
-
-    def test_assume_ai_is_monotonic_over_strict(self):
-        # a mark the STRICT gate accepted must never be dropped by the assumed floor:
-        # assume_ai only ever adds recall
-        weak_but_strict = self._c("gemini", strict=True, relaxed=True, relaxed_conf=0.40)
-        fired = reg.decide([weak_but_strict], reg.Context(sensitivity="assume_ai"))
-        assert [d.candidate.key for d in fired] == ["gemini"]
-        assert fired[0].relax is False  # accepted on the strict verdict, so mask at strict
 
     def test_auto_relaxes_on_provenance(self):
         c = [self._c("gemini", relaxed=True)]
@@ -308,6 +333,35 @@ class TestArbiter:
             self._c("jimeng_pill", strict=True, relaxed=True, flat=False),
         ]
         assert "jimeng_pill" in self._keys(cands, reg.Context())
+
+    def test_weak_pill_detection_does_not_confirm_the_jimeng_wordmark(self):
+        """The pill is too false-fire-prone (~7%) to grant a sibling `confirmed` trust.
+
+        Corpus-measured defect (2026-07-18): a pill false fire on clean non-ByteDance
+        content confirmed jimeng, relaxing its NCC gate 0.45 -> 0.3825; jimeng then
+        false-fired, and _keep_pill's wordmark arm removed the pill UNRESTRICTED,
+        skipping the flatness guard. Closed loop on the default `auto` path.
+        """
+        # Only the pill is strictly detected. jimeng scores in the band that is
+        # reachable ONLY via the relaxed gate.
+        cands = [
+            self._c("jimeng_pill", strict=True, relaxed=True, flat=False),
+            self._c("jimeng", strict=False, relaxed=True),
+        ]
+        fired = {d.candidate.key for d in reg.decide(cands, reg.Context("auto", frozenset()))}
+        assert "jimeng" not in fired, "a weak pill hit must not relax the jimeng wordmark"
+        # and with jimeng gone, the pill loses the wordmark arm too -- no unrestricted
+        # removal of a textured footprint on content nothing confirmed.
+        assert "jimeng_pill" not in fired
+
+    def test_real_jimeng_wordmark_still_corroborates_the_pill(self):
+        """The fix removes only the pill's TESTIMONY, not the wordmark's."""
+        cands = [
+            self._c("jimeng", strict=True, relaxed=True),
+            self._c("jimeng_pill", strict=True, relaxed=True, flat=False),
+        ]
+        fired = {d.candidate.key for d in reg.decide(cands, reg.Context("auto", frozenset()))}
+        assert fired == {"jimeng", "jimeng_pill"}
 
 
 class TestProvenanceMaskThreading:
