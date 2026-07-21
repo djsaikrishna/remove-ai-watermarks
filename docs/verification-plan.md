@@ -723,18 +723,53 @@ number for a per-request worker; warm is the honest number for a long-lived one.
 Everything below is known, measured, and deliberately not done yet. Each line says what it
 would take, so none of it has to be rediscovered.
 
-### Defects
+### START HERE next session
+
+The verification campaign is finished for everything that does not need new labelled data.
+In priority order, with the reason each sits where it does:
+
+1. **Harvest labelled positives for the uncovered vendors** (`千问`, `百度`, and the
+   `星绘`/`抖音` class). This is the only thing that unblocks anything else. Every cheap
+   detector lever was measured to exhaustion this session and all are dead ends, so the
+   remaining questions -- can 千问 be registered, at what gate, does samsung's residual
+   generalize, is jimeng's 71% real -- all reduce to "we have too few examples to tell".
+   Tool: `scripts/cjk_tail_probe.py` (a harvesting aid, NOT a detector: measured 0.407 for
+   a bold 千问 positive against a clean p99 of 0.298). Target 30+ per vendor, then calibrate.
+2. **Decide the exit-code split** (open defect 2). It is a deliberate product call, not
+   research: it is breaking for existing wrappers, so it needs a yes/no rather than more
+   measurement.
+3. **The two small correctness items** (open defects 3 and 4) -- both are contained, both
+   have the fix written out below.
+
+Do NOT restart the sweeps to "check". Their artifacts are on disk and listed under
+"Completed full runs" below; re-running costs hours and answers nothing new. The fast way
+to confirm the whole surface still works after a change is
+`uv run python scripts/real_examples_e2e.py` (~2 min, real corpus examples through the real
+CLI) plus `uv run python scripts/robustness_suite.py` (~3 min, adversarial inputs).
+
+### Open defects
 
 | # | Defect | Measured impact | What the fix takes |
 |---|---|---|---|
 | 1 | 16-bit PNGs are downconverted to 8-bit by a metadata strip | 42 of 27,018 corpus PNGs (0.16%); one went 9.2 MB -> 2.5 MB | a byte-level PNG chunk stripper, so the PIL re-save is skipped entirely |
 | 2 | Exit code 2 means three different things (no visible mark / no invisible signal / Click usage error) | any wrapper must parse stderr to tell them apart | split the codes; **breaking for existing wrappers**, so it needs a deliberate call |
-| 3a | ~~the full visible-parity sweep has NOT been re-run since the doubao front-end fix~~ **DONE 2026-07-20** | doubao parity moved **91.8% -> 99.3%** (2562/2580) as predicted; gemini/jimeng/samsung unchanged, `_visible_parity_cv2_v2.csv` | closed |
 | 3 | `visible_removal_audit.py` measures the UNGATED per-mark path | reports the pill at 32% where the product runs at 100% precision | teach it the product path (`remove_auto_marks`) for gated marks, or at minimum say so loudly in its docstring |
-| 5 | samsung leaves a residual just over its gate on the weakest of its 3 corpus positives | 0.431 -> 0.404 against a 0.40 gate; the other two clear outright | a faint-mask fallback for the `binary` front-end (samsung has none), but **do not tune on n=3** -- it needs more positives first, same blocker as everything else in Tier C |
-| 4 | the faint-mask fallback fills the WHOLE corner box, not the glyph | 12 of 12 real faint-path frames covered 100% of the corner ROI (120.9% median with padding); the path fires on ~8% of doubao detections | fixed 2026-07-20 -- see below |
+| 4 | `invisible_engine.py:346` still discards `imwrite`'s success flag | same shape as the crash fixed 2026-07-20, on the diffusion output path; not yet observed failing | check the bool and raise/report, mirroring `cli._write_output_or_exit` |
+| 5 | samsung leaves a residual just over its gate on the weakest of its 3 corpus positives | 0.431 -> 0.404 against a 0.40 gate; the other two clear outright | a faint-mask fallback for the `binary` front-end (samsung has none), but **do not tune on n=3** -- blocked behind item 1 above |
 
-**Defect 4 in full, because it is instructive.** The fallback I added on 2026-07-19 reads
+### Closed 2026-07-20 (kept for the reasoning, not for action)
+
+- **The visible-parity re-run** confirmed the doubao front-end fix: **91.8% -> 99.3%**
+  (2562/2580), gemini/jimeng/samsung unchanged. Artifact `_visible_parity_cv2_v2.csv`.
+- **The faint-mask fallback filled the whole corner box** instead of the glyph. Fixed with
+  the detector's own best-match box; full reasoning immediately below, because how it
+  escaped both parity and its own regression test is the instructive part.
+- **Three crash-class defects** found by Tier E and the /simplify review (failed writes
+  crashing on the size report, batch losing data silently, directories crashing the
+  scanner) -- see the Tier E section.
+
+**The faint-mask defect in full, because it is instructive.** The fallback added on
+2026-07-19 reads
 `np.where(resp >= _FAINT_GLYPH_LEVEL)` with the constant at `0.5`, and its comment says
 "thresholded relative to its own peak". But `tophat_response` returns **uint8 0..255**, so
 `>= 0.5` selects every pixel with value >= 1 -- the entire non-zero response, not half the
@@ -792,7 +827,9 @@ patched torch version exists -- do not re-triage it", which is now stale. Either
 
 ### Where detection work should go next
 
-Measured this session, in the order the evidence supports:
+This is the EVIDENCE behind "START HERE" item 1, not a competing list -- it records what was
+measured and ruled out, so the next session does not re-run any of it. In the order the
+evidence supports:
 
 1. **Not the ladder, not the threshold, not the landscape rung.** All three were measured
    to completion and all three are dead ends: the dense ladder buys 7.6% of misses for a
@@ -813,6 +850,24 @@ Measured this session, in the order the evidence supports:
    corners by only 0.407 vs a clean p99 of 0.298. A 4-glyph run is simply less specific
    than a 6-glyph one. Treat it as a harvesting aid, not a detector.
 
+### Completed full runs -- do not re-run to "check"
+
+Each of these took from tens of minutes to hours and its artifact is on disk (gitignored,
+under `data/spaces/`). A later session asking "did we actually cover X" should read the
+artifact, not relaunch the sweep. Row counts are what the file held when written.
+
+| Run | What it covered | Rows | Artifact |
+|---|---|---|---|
+| A1 sidecar regression | the whole corpus re-run through `identify`, diffed against recorded verdicts | 39,314 | `_sidecar_regression.jsonl` |
+| A2 visible parity (v1 pre-fix, v2 post-fix) | detect -> remove -> re-detect per mark | 10,594 x2 | `_visible_parity_cv2{,_v2}.csv` |
+| metadata removal audit | strip-and-verify, detection/removal parity | 21,654 | `_metadata_removal_audit.csv` |
+| B1 fill quality | stamped ground truth, per backend and background | 1,200 | `_fill_quality.jsonl` |
+| pill gate audit | the pill through the PRODUCT path, not the ungated one | 2,738 | `_pill_gate_audit.jsonl` |
+| B2 / ladder headroom | the scale-ladder and threshold questions, to exhaustion | 4,469 | `_ladder_headroom_doubao.jsonl` |
+| E robustness | 34 adversarial CLI cases | -- | rerun is ~3 min, no artifact needed |
+| B4 resource ceilings | peak RSS per backend, 1 MP -> 25 MP | 12 cells | rerun is ~2 min |
+| real-example E2E | every command over real corpus examples | 28 checks | rerun is ~2 min (+ diffusion) |
+
 ### Verification tiers not run
 
 - **C recall expansion** -- gated by labelling appetite. This is now the ONLY unrun tier,
@@ -821,14 +876,6 @@ Measured this session, in the order the evidence supports:
   n=6, samsung on n=3).
 
 (Tiers E and B4 are now RUN -- see the sections above.)
-
-### Recommended next step
-
-**Harvest labelled positives for the uncovered vendors.** Everything cheaper has now been
-measured and found empty, and every remaining question -- can 千问 be registered, what gate,
-does the landscape rung generalize -- is blocked on the same missing thing: labelled
-examples. Jimeng recall still rests on n=14 and the pill's on n=6, so those are equally
-unimprovable-because-unmeasurable.
 
 ## Standing gap
 
