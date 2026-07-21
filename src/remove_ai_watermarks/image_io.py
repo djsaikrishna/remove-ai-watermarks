@@ -221,8 +221,8 @@ def read_bgr_and_alpha(path: str | Path) -> tuple[NDArray[Any] | None, NDArray[A
     return image, None
 
 
-def write_bgr_with_alpha(path: str | Path, bgr: NDArray[Any], alpha: NDArray[Any] | None) -> None:
-    """Write BGR (with optional alpha) to ``path``.
+def write_bgr_with_alpha(path: str | Path, bgr: NDArray[Any], alpha: NDArray[Any] | None) -> bool:
+    """Write BGR (with optional alpha) to ``path``. Returns ``imwrite``'s success flag.
 
     When ``alpha`` is provided and the output extension supports it, the original
     alpha plane is rejoined unchanged. The watermark region is NOT made transparent:
@@ -230,10 +230,15 @@ def write_bgr_with_alpha(path: str | Path, bgr: NDArray[Any], alpha: NDArray[Any
     transparent hole that renders as a white box on any non-transparent viewer
     (issue #30). Preserving the input alpha keeps genuinely transparent backgrounds
     intact without inventing new holes.
+
+    Returning the flag is load-bearing: :func:`imwrite` is contractually non-raising, so
+    this is the ONLY signal a caller gets that the file was not created. Discarding it let
+    a failed write (read-only directory, full disk) run on to ``output.stat()`` and die
+    with a bare ``FileNotFoundError`` traceback instead of a readable error.
+    Regression: ``tests/test_cli_robustness.py::TestFailedWriteIsReported``.
     """
     import numpy as np
 
     if alpha is None or Path(path).suffix.lower() not in ALPHA_FORMATS:
-        imwrite(path, bgr)
-        return
-    imwrite(path, np.dstack([bgr, alpha]))
+        return imwrite(path, bgr)
+    return imwrite(path, np.dstack([bgr, alpha]))

@@ -410,6 +410,22 @@ def _parse_sensitivity(value: str) -> watermark_registry.Sensitivity:
 EXIT_NO_VISIBLE_MARK = 2
 
 
+def _write_output_or_exit(output: Path, bgr: NDArray[Any], alpha: NDArray[Any] | None) -> None:
+    """Write the final image, or fail with a readable error instead of a traceback.
+
+    `image_io.imwrite` is contractually NON-RAISING: it returns False when the codec
+    rejects the image or the path cannot be written. Every caller here follows its write
+    with `output.stat()` to report the size, so a silently-failed write (read-only
+    directory, full disk) died with a bare `FileNotFoundError` traceback pointing at the
+    stat, not at the write. Found by the Tier E adversarial sweep 2026-07-20.
+    Regression: `tests/test_cli_robustness.py::TestFailedWriteIsReported`.
+    """
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if not image_io.write_bgr_with_alpha(output, bgr, alpha):
+        console.print(f"  Error: failed to write output (is the destination writable?): {output}")
+        raise SystemExit(1)
+
+
 def _no_visible_mark_exit(source: Path) -> NoReturn:
     """Explain why no visible watermark was removed, then exit non-zero.
 
@@ -566,8 +582,11 @@ def _run_visible_auto(
     except RuntimeError as e:  # selected migan/lama backend whose extra is absent
         console.print(f"  Error: {e}")
         raise SystemExit(1) from e
-    except (ValueError, OSError) as e:  # unreadable / truncated / non-image input
-        console.print(f"  Error: cannot read image {source.name}: {e}")
+    except (ValueError, OSError) as e:
+        # Covers BOTH an unreadable input and an unwritable output, so the message must
+        # not assert which: it used to say "cannot read image <input>" while quoting the
+        # OUTPUT path, blaming the wrong file (Tier E, 2026-07-20).
+        console.print(f"  Error: {e}")
         raise SystemExit(1) from e
 
     elapsed = time.monotonic() - t0
@@ -630,8 +649,7 @@ def _run_visible_explicit(
         raise SystemExit(1) from e
     elapsed = time.monotonic() - t0
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    image_io.write_bgr_with_alpha(output, result, alpha)
+    _write_output_or_exit(output, result, alpha)
     if strip_metadata:
         try:
             from remove_ai_watermarks.metadata import remove_ai_metadata
@@ -646,7 +664,7 @@ def _run_visible_explicit(
 
 
 @main.command("visible")
-@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@click.argument("source", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
     "-o", "--output", type=click.Path(path_type=Path), default=None, help="Output path (default: <source>_clean.<ext>)."
 )
@@ -729,7 +747,7 @@ def _parse_region(spec: str) -> tuple[int, int, int, int]:
 
 
 @main.command("erase")
-@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@click.argument("source", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--region", "regions", multiple=True, required=True, help="x,y,w,h box to erase (repeatable).")
 @click.option(
     "-o", "--output", type=click.Path(path_type=Path), default=None, help="Output path (default: <source>_clean.<ext>)."
@@ -787,8 +805,7 @@ def cmd_erase(
         raise SystemExit(1) from e
     elapsed = time.monotonic() - t0
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    image_io.write_bgr_with_alpha(output, result, alpha)
+    _write_output_or_exit(output, result, alpha)
 
     if strip_metadata:
         try:
@@ -805,7 +822,7 @@ def cmd_erase(
 
 # ── Invisible watermark removal ──
 @main.command("invisible")
-@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@click.argument("source", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
     "-o", "--output", type=click.Path(path_type=Path), default=None, help="Output path (default: <source>_clean.<ext>)."
 )
@@ -941,7 +958,7 @@ def cmd_invisible(
 
 # ── Metadata operations ──
 @main.command("metadata")
-@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@click.argument("source", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--check", is_flag=True, help="Check for AI metadata (don't modify).")
 @click.option("--remove", is_flag=True, help="Remove AI metadata.")
 @click.option(
@@ -1008,7 +1025,7 @@ def cmd_metadata(
 
 # ── Provenance identification ──
 @main.command("identify")
-@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@click.argument("source", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
     "--no-visible",
     is_flag=True,
@@ -1077,7 +1094,7 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
 
 # ── Combined "all" mode ──
 @main.command("all")
-@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@click.argument("source", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
     "-o", "--output", type=click.Path(path_type=Path), default=None, help="Output path (default: <source>_clean.<ext>)."
 )
@@ -1278,12 +1295,11 @@ def cmd_all(
         # The invisible step (and downstream cv2.IMREAD_COLOR paths) drops alpha,
         # so re-attach the original alpha plane unchanged when writing the final
         # output for transparent formats.
-        output.parent.mkdir(parents=True, exist_ok=True)
         final_bgr, _ = image_io.read_bgr_and_alpha(tmp_path)
         if final_bgr is None:
             console.print(f"Error: Failed to read intermediate file: {tmp_path}")
             raise SystemExit(1)
-        image_io.write_bgr_with_alpha(output, final_bgr, alpha)
+        _write_output_or_exit(output, final_bgr, alpha)
 
     finally:
         # Clean up temp file if it still exists
@@ -1319,8 +1335,10 @@ def _passthrough_copy(img_path: Path, out_path: Path) -> None:
     """Copy the input's pixels through to ``out_path`` unchanged (the invisible-mode skip
     paths), so the output dir stays complete without touching the pixels."""
     src_bgr, src_alpha = image_io.read_bgr_and_alpha(img_path)
-    if src_bgr is not None:
-        image_io.write_bgr_with_alpha(out_path, src_bgr, src_alpha)
+    if src_bgr is not None and not image_io.write_bgr_with_alpha(out_path, src_bgr, src_alpha):
+        # The point of this copy is to keep the output dir COMPLETE. A silently-dropped
+        # copy defeats that and leaves a hole the caller cannot see (Tier E, 2026-07-20).
+        raise OSError(f"failed to copy input through to output: {out_path}")
 
 
 @dataclass(frozen=True)
@@ -1455,7 +1473,12 @@ def _process_batch_image(
             sensitivity=options.sensitivity,
         )
 
-        image_io.write_bgr_with_alpha(out_path, result, alpha)
+        # RAISE, never SystemExit: the batch loop catches per-image exceptions, counts
+        # them and exits non-zero. Discarding this flag made a read-only output directory
+        # produce ZERO files and still exit 0 -- silent data loss that also contradicted
+        # the documented batch contract (Tier E, 2026-07-20).
+        if not image_io.write_bgr_with_alpha(out_path, result, alpha):
+            raise OSError(f"failed to write output (is the destination writable?): {out_path}")
         saved_alpha = alpha
 
     if mode in ("invisible", "all"):
@@ -1479,8 +1502,8 @@ def _process_batch_image(
     # so re-attach the cached alpha when the input had transparency.
     if mode == "all" and saved_alpha is not None:
         final_bgr, _ = image_io.read_bgr_and_alpha(out_path)
-        if final_bgr is not None:
-            image_io.write_bgr_with_alpha(out_path, final_bgr, saved_alpha)
+        if final_bgr is not None and not image_io.write_bgr_with_alpha(out_path, final_bgr, saved_alpha):
+            raise OSError(f"failed to re-attach alpha to output: {out_path}")
 
     return synthid_skipped
 

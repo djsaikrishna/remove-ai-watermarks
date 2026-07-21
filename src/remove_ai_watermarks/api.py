@@ -105,7 +105,13 @@ def _write_visible_result(
 
             shutil.copyfile(source_path, out_path)
     else:
-        image_io.write_bgr_with_alpha(out_path, result, loaded.alpha)
+        # imwrite is contractually NON-RAISING, so this bool is the only signal the file
+        # was not created. Unchecked, the metadata strip below ran on a nonexistent path
+        # and surfaced as a confusing "cannot read image <INPUT>" naming the OUTPUT path
+        # (Tier E, 2026-07-20). Raise here so a library caller and the CLI both get an
+        # accurate message about the write.
+        if not image_io.write_bgr_with_alpha(out_path, result, loaded.alpha):
+            raise OSError(f"failed to write output (is the destination writable?): {out_path}")
 
     if strip_metadata:
         from remove_ai_watermarks import metadata

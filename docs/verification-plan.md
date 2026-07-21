@@ -579,6 +579,145 @@ bug (`scale_basis`) directly.
 This section records what the measurements imply technically. Prioritization is tracked
 separately, outside this repo.
 
+## Real-example end-to-end run (2026-07-20)
+
+The corpus sweeps all call the library IN-PROCESS. This run drives the actual
+`remove-ai-watermarks` entry point as a user would, over real corpus images and the
+committed real fixtures, and checks the OUTCOME rather than the exit code
+(`scripts/real_examples_e2e.py`). **26 of 28 behaviours passed.**
+
+| Command | Real examples | Result |
+|---|---|---|
+| `identify --json` | 6 provenance classes (OpenAI, Adobe, Midjourney, Doubao/TC260, Grok, FLUX) | 6/6 correct verdict + platform |
+| `metadata --check` / `--remove` | the same 5 real AI-metadata files | 10/10 detected, and the output re-scans clean |
+| `visible --mark auto` | a live positive per mark | doubao / jimeng / gemini removed and re-detect clean; pill correctly DECLINED by the gate; samsung partial (below) |
+| `erase --region` | one real image x 3 backends | cv2 / MI-GAN / big-LaMa all wrote output |
+| `batch --mode visible` | a real 5-image directory | 5/5 outputs |
+| `invisible` (MPS, `--max-resolution 512`) | a real Gemini and a real OpenAI carrier | both wrote a genuinely CHANGED image |
+| `all` (MPS) | a real Gemini carrier | one transient exit 1, not reproducible (see below) |
+
+**Samsung is a real, reproducible partial.** It is the faintest registered mark (peak alpha
+~0.38) sitting on a 0.40 gate, so the margin between "detected" and "removed" is razor thin.
+Over the entire corpus population (n=3, all of it) the CLI clears 2 of 3 outright
+(0.446 and 0.440 -> below gate) and on the weakest one reduces 0.431 -> **0.404**, which is
+still fractionally over the gate. The glyph IS filled and the confidence IS reduced; the
+residual re-detects. This is the faint-mark residual class on the `binary` front-end, which
+has no equivalent of the `tophat` faint-mask fallback. **Not fixed:** with n=3 corpus-wide
+there is no way to tell an improvement from noise, which is the same
+improving-what-3-samples-measure trap recorded under Open items.
+
+**The pill "failure" was the harness, not the product.** `detect_marks` fires `jimeng_pill`
+but `remove_auto_marks` returns no label -- `_keep_pill` correctly declines an uncorroborated
+low-confidence pill, so `visible` writes nothing and exits 2. The harness now asks the
+product what it DECIDED and treats a correct decline as a pass.
+
+**The `all` exit 1 did not reproduce** -- the same invocation ran clean standalone twice and
+again in the exact three-run sequence that produced it (all exit 0, step 2 executed, no skip
+banner). It stays recorded as a transient because it could not be diagnosed: the harness
+discarded the command output, and `cmd_all` has three distinct `SystemExit(1)` paths
+(unreadable input, unreadable intermediate, and the deliberate synthid-skipped banner) that
+an exit code alone cannot distinguish. The harness now retains the output tail on any
+failure, so a recurrence is identifiable.
+
+## Tier E: robustness (2026-07-20) -- RUN, and it found two real crashes
+
+`scripts/robustness_suite.py` drives the real CLI over adversarial and degenerate inputs and
+scores GRACEFULNESS, not success: a non-zero exit with a readable message is a pass, an
+unhandled traceback or a hang is a fail. **33/33 graceful after two fixes; 31/33 before.**
+
+Covered: truncated and corrupt files, zero-byte, a text file named `.jpg`, 1x1 and
+1x4000 slivers, a 729 KB decompression bomb declaring 16000x16000, Unicode and RTL
+filenames (read AND write), a mismatched extension, a nonexistent nested output dir, a
+read-only output dir, a directory passed as a file, a missing path, 4x concurrent runs
+against one input, and batch over both an empty and an undecodable directory.
+
+**Both defects were invisible to the 849-test suite**, because unit tests feed well-formed
+fixtures into writable directories. Both are now regression-guarded by
+`tests/test_cli_robustness.py`.
+
+1. **A failed write crashed on the size report.** `image_io.imwrite` is contractually
+   non-raising -- it returns `False` when the path cannot be written. But
+   `write_bgr_with_alpha` discarded that bool and returned `None`, so **no caller could
+   distinguish a failed write from a successful one**, and all five write sites then ran
+   `output.stat()` to print the size. A read-only output directory produced a bare
+   `FileNotFoundError` traceback pointing at the stat rather than at the write. The signal
+   existed the whole way down and was thrown away by one wrapper. Fixed at that wrapper
+   (propagate the flag) plus one shared `cli._write_output_or_exit`, so all sites are
+   covered rather than the one that happened to be caught.
+2. **A directory passed as the image crashed the scanner.** `click.Path(exists=True)`
+   accepts directories unless told otherwise, so `identify <dir>` reached `open()` and
+   raised `IsADirectoryError`. Fixed by `dir_okay=False` on all six `source` arguments --
+   argument parsing now refuses it, which is where it belongs. (`batch` was already correct:
+   it declares `file_okay=False`.)
+
+3. **The worst instance was found by the /simplify review, not by the sweep: `batch` into a
+   read-only directory wrote ZERO files for 2 inputs and exited 0.** No traceback, no
+   error, a success code and an empty output directory -- a wrapping service would treat
+   that as a completed run. `graceful()` structurally cannot see this class, because it
+   scores exit code and traceback markers and this failure has neither. The suite now
+   carries a `batch_readonly_outdir` case that asserts on the ARTIFACTS (how many files
+   exist) rather than on the status. **Any check for a silent no-op has to assert on the
+   output, not the exit code.**
+
+The fix is NOT uniform, and that matters: the single-image commands exit via
+`cli._write_output_or_exit`; `api._write_visible_result` RAISES so a library caller gets an
+accurate error rather than a confusing `FileNotFoundError` from the downstream metadata
+strip; and the batch sites raise too but must never `SystemExit`, because the batch loop
+counts per-image exceptions and aborting would kill the whole run instead of failing one
+image.
+
+The lesson worth keeping: **a non-raising IO contract needs its return value checked at
+every call site, and a wrapper that swallows it silently disables the contract for
+everyone downstream.** Grep for other `-> None` wrappers over non-raising primitives --
+`invisible_engine.py:346` still discards `imwrite`'s flag and is the same shape.
+
+## Tier B4: resource ceilings (2026-07-20) -- RUN
+
+`scripts/resource_ceilings.py`, one FRESH process per cell (peak RSS inside a long-lived
+process is contaminated by whatever ran before it, and the question is what a per-request
+worker needs). The mask is a fixed, small corner region at every input size, so the thing
+under test is whether the learned backends really crop around the MARK rather than
+processing the frame.
+
+| backend | peak RSS 1MP -> 25MP | wall | scaling |
+|---|---|---|---|
+| cv2 | 74 -> 440 MB | 0.02-0.12 s | **grows 5.9x with input size** |
+| migan | 603 -> 775 MB | ~0.6 s | flat |
+| lama | 4679 -> 4779 MB | ~3.8 s | flat |
+
+**The documented claims hold.** CLAUDE.md's "migan ~0.6-0.9 GB regardless of upload size"
+and "lama ~4.7 GB peak" both reproduce to the digit, and the crop-around-the-mask design is
+confirmed: both learned backends are flat in input size. This is also the measurement
+behind the deployment split (free tier `migan` fits a small droplet under 1 GB; paid tier
+`lama` needs ~5 GB).
+
+**New information: cv2 is the only backend that scales with the input.** It inpaints the
+full frame rather than a crop, so at 25 MP it costs 440 MB -- still the cheapest tier, but
+6x its small-image footprint, which is worth knowing when sizing a worker that accepts
+phone-camera uploads. Its wall time stays trivial throughout.
+
+Caveat on the wall times: each is a COLD process including model load, so migan's ~0.6 s
+here is not comparable to the ~0.19 s warm figure quoted elsewhere. Cold is the honest
+number for a per-request worker; warm is the honest number for a long-lived one.
+
+**Two method notes, both cases of the harness corrupting its own measurement.**
+
+1. The first version called `erase()` with a positional `boxes` argument, which the
+   keyword-only signature rejects. All 12 cells failed identically and still reported
+   plausible-looking RSS (60-129 MB) -- the process's numpy footprint with no backend work
+   at all. Twelve identical failures were one bad call, and only the printed error made
+   that visible. The child now asserts the output actually differs, so a no-op cannot be
+   reported as a measurement.
+2. That assertion was then itself the contaminant: `(out != img).any()` allocates a boolean
+   temp the size of the IMAGE before `getrusage` is read -- ~75 MB at 25 MP, and it grows
+   with the input, so the harness partly manufactured the very "cv2 scales with input size"
+   conclusion it was measuring. Now it compares only the mask box. **Re-measured: the
+   conclusion survived, the digits moved.** cv2 6.1x -> 5.9x, migan max 847 -> 775 MB, lama
+   max 4849 -> 4779 MB; the table above is the corrected run. Worth keeping because the
+   contaminated numbers were already committed to CLAUDE.md before the check was
+   questioned -- a verification step is part of the instrument and needs the same scrutiny
+   as the thing it verifies.
+
 ## Open items (as of 2026-07-20)
 
 Everything below is known, measured, and deliberately not done yet. Each line says what it
@@ -592,6 +731,7 @@ would take, so none of it has to be rediscovered.
 | 2 | Exit code 2 means three different things (no visible mark / no invisible signal / Click usage error) | any wrapper must parse stderr to tell them apart | split the codes; **breaking for existing wrappers**, so it needs a deliberate call |
 | 3a | ~~the full visible-parity sweep has NOT been re-run since the doubao front-end fix~~ **DONE 2026-07-20** | doubao parity moved **91.8% -> 99.3%** (2562/2580) as predicted; gemini/jimeng/samsung unchanged, `_visible_parity_cv2_v2.csv` | closed |
 | 3 | `visible_removal_audit.py` measures the UNGATED per-mark path | reports the pill at 32% where the product runs at 100% precision | teach it the product path (`remove_auto_marks`) for gated marks, or at minimum say so loudly in its docstring |
+| 5 | samsung leaves a residual just over its gate on the weakest of its 3 corpus positives | 0.431 -> 0.404 against a 0.40 gate; the other two clear outright | a faint-mask fallback for the `binary` front-end (samsung has none), but **do not tune on n=3** -- it needs more positives first, same blocker as everything else in Tier C |
 | 4 | the faint-mask fallback fills the WHOLE corner box, not the glyph | 12 of 12 real faint-path frames covered 100% of the corner ROI (120.9% median with padding); the path fires on ~8% of doubao detections | fixed 2026-07-20 -- see below |
 
 **Defect 4 in full, because it is instructive.** The fallback I added on 2026-07-19 reads
@@ -675,10 +815,12 @@ Measured this session, in the order the evidence supports:
 
 ### Verification tiers not run
 
-- **B4 resource ceilings** -- peak RSS and wall time per backend x input size to 25 MP.
-- **E robustness** -- truncated, corrupt, absurd dimensions, decompression bombs, unicode
-  and RTL filenames, read-only output dirs, concurrent runs on one file.
-- **C recall expansion** -- gated by labelling appetite.
+- **C recall expansion** -- gated by labelling appetite. This is now the ONLY unrun tier,
+  and it is blocked on data rather than effort: every remaining detector question needs
+  labelled positives (30+ per uncovered vendor; jimeng still rests on n=14, the pill on
+  n=6, samsung on n=3).
+
+(Tiers E and B4 are now RUN -- see the sections above.)
 
 ### Recommended next step
 
