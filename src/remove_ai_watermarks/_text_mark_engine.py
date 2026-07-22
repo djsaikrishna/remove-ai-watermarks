@@ -97,7 +97,9 @@ class TextMarkConfig:
 
     name: str  # short label for log lines (e.g. "Doubao")
     asset_name: str  # bundled alpha PNG under assets/ (e.g. "doubao_alpha.png")
-    corner: Literal["br", "bl"]  # bottom-right (Doubao/Jimeng) or bottom-left (Samsung)
+    corner: Literal[
+        "br", "bl", "tl", "bc"
+    ]  # bottom-right (Doubao/Jimeng), bottom-left (Samsung), top-left (RunningHub), bottom-center (LibLibAI)
     margin_floor: int  # min margin in px for locate (4 for br marks, 2 for Samsung)
     # locate geometry (fraction of scale_base -- see scale_base())
     width_frac: float
@@ -125,7 +127,12 @@ class TextMarkConfig:
     # correlates a binary silhouette against it; "tophat" correlates the CONTINUOUS
     # top-hat response against a soft template and never binarizes. See
     # TextMarkEngine.tophat_response for the measurement that motivated the split.
-    detect_frontend: Literal["binary", "tophat"] = "binary"
+    # "gray" correlates the silhouette against the raw GRAYSCALE of the locate box:
+    # for a faint mid-gray mark (RunningHub) the top-hat's background-subtraction and
+    # max-normalization suppress the response to clean-arm levels (positives 0.16-0.23
+    # vs clean p99 0.31), while raw gray NCC separates (positives 0.38-0.54 vs clean
+    # p99 0.264 / max 0.304, measured 2026-07-22). Contrast-DEPENDENT, unlike tophat.
+    detect_frontend: Literal["binary", "tophat", "gray"] = "binary"
     # Gaussian sigma applied to the template in the "tophat" front-end (0 = none).
     template_blur: float = 0.0
     # Which image dimension the mark's size and margins scale with. VENDOR-SPECIFIC,
@@ -391,6 +398,42 @@ class TextMarkEngine:
         """The detection score alone -- the box the removal mask needs is discarded here."""
         return self._tophat_best(image, loc)[0]
 
+    def _gray_best(self, image: NDArray[Any], loc: TextMarkLocation) -> tuple[float, tuple[int, int, int, int] | None]:
+        """Best TM_CCOEFF_NORMED of the silhouette against the raw GRAYSCALE ROI, and
+        the ROI-local box (x0, y0, x1, y1) of that best match.
+
+        Mirrors :meth:`_tophat_best` (same ladder sweep, same one-method contract so
+        detection and the removal mask can never drift), but skips the top-hat
+        entirely: the RunningHub mark is a faint mid-gray text the top-hat's
+        background subtraction suppresses to clean-arm levels, while raw gray NCC
+        separates (see ``TextMarkConfig.detect_frontend``). Contrast-DEPENDENT by
+        construction, so the gate must be picked against the clean arm, which is
+        what ``scripts/vendor_mark_calibrate.py`` does.
+        """
+        c = self.config
+        x, y, bw, bh = loc.bbox
+        if bh < 16 or bw < 16:
+            return (0.0, None)
+        roi = cv2.cvtColor(image_io.to_bgr(image[y : y + bh, x : x + bw]), cv2.COLOR_BGR2GRAY)
+        sil = self._glyph_silhouette()
+        if sil is None:
+            return (0.0, None)
+        base = self.scale_base(image)
+        best_score = 0.0
+        best_box: tuple[int, int, int, int] | None = None
+        for scale in c.ladder:
+            gw = max(c.min_gw, int(c.alpha_width_frac * base * scale))
+            gh = max(4, int(c.alpha_height_frac * base * scale))
+            if gw >= roi.shape[1] or gh >= roi.shape[0]:
+                continue
+            tmpl = cv2.resize(sil, (gw, gh), interpolation=cv2.INTER_AREA)
+            result = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
+            _, score, _, top_left = cv2.minMaxLoc(result)
+            if score > best_score:
+                tx, ty = int(top_left[0]), int(top_left[1])
+                best_score, best_box = float(score), (tx, ty, tx + gw - 1, ty + gh - 1)
+        return (best_score, best_box)
+
     def scale_base(self, image: NDArray[Any]) -> int:
         """The image dimension this mark's geometry scales with.
 
@@ -433,8 +476,14 @@ class TextMarkEngine:
         wm_h = max(16, int(base * c.height_frac))
         margin_x = max(c.margin_floor, int(base * c.margin_x_frac))
         margin_b = max(c.margin_floor, int(base * c.margin_bottom_frac))
-        x = max(0, w - margin_x - wm_w) if c.corner == "br" else min(margin_x, max(0, w - wm_w))
-        y = max(0, h - margin_b - wm_h)
+        if c.corner == "br":
+            x = max(0, w - margin_x - wm_w)
+        elif c.corner == "bc":  # bottom-center: horizontally centered, margin_x unused
+            x = max(0, (w - wm_w) // 2)
+        else:
+            x = min(margin_x, max(0, w - wm_w))
+        # "tl" anchors at the top instead: margin_bottom_frac is then the TOP margin.
+        y = min(margin_b, max(0, h - wm_h)) if c.corner == "tl" else max(0, h - margin_b - wm_h)
         wm_w = min(wm_w, w - x)
         wm_h = min(wm_h, h - y)
         return TextMarkLocation(x=x, y=y, w=wm_w, h=wm_h, is_fallback=True)
@@ -526,6 +575,15 @@ class TextMarkEngine:
             det.detected = score >= threshold and self._rival_margin_ok(score, box, self.scale_base(image))
             logger.debug("%s detect (tophat): ncc=%.2f thr=%.2f detected=%s", c.name, score, threshold, det.detected)
             return det
+        if c.detect_frontend == "gray":
+            # Same no-coverage-gate reasoning as tophat: the gray front-end never
+            # binarizes, so a blob-area heuristic does not apply to it either.
+            score = self._gray_best(image, loc)[0]
+            threshold = c.detect_ncc_threshold * (c.provenance_ncc_factor if provenance else 1.0)
+            det.confidence = score
+            det.detected = score >= threshold and self._rival_margin_ok(score, box, self.scale_base(image))
+            logger.debug("%s detect (gray): ncc=%.2f thr=%.2f detected=%s", c.name, score, threshold, det.detected)
+            return det
         if coverage >= c.detect_min_coverage:
             score = self._template_match_score(box, self.scale_base(image))
             threshold = c.detect_ncc_threshold * (c.provenance_ncc_factor if provenance else 1.0)
@@ -578,7 +636,14 @@ class TextMarkEngine:
         glyph = self.extract_mask(image, loc)  # box-sized, 255 = glyph
         ys, xs = np.where(glyph > 0)
         box: tuple[int, int, int, int] | None = None
-        if xs.size >= self._MIN_GLYPH_PIXELS:
+        if self.config.detect_frontend == "gray" and self.detect(image).detected:
+            # The gray front-end exists for marks the top-hat under-segments, so the
+            # binary blob is NOT authoritative here: trusting it first bounded the
+            # fill by a PARTIAL blob (the faint head glyphs dropped out) and left the
+            # leftmost "Runni" of "RunningHub AI生成" unremoved (2026-07-22). Use the
+            # detector's own best-match box, same as the tophat faint path below.
+            _, box = self._gray_best(image, loc)
+        elif xs.size >= self._MIN_GLYPH_PIXELS:
             box = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
         elif self.config.detect_frontend == "tophat" and self.detect(image).detected:
             # A mark found only by the CONTINUOUS front-end has no binary glyph blob to

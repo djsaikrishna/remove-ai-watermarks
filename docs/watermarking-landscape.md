@@ -70,7 +70,7 @@ Two consequences we can exploit: (1) the 5% floor is a **scale prior** -- a comp
 
 **星绘 is ByteDance (VERIFIED (a): Baidu Baike + App Store listing, now branded 豆包旗下, team folded into Doubao April 2025).** So `星绘AI生成` is very likely the Doubao house style -- same typeface, same corner, possibly the same top-left `AI生成` pill. Starting from the Doubao `TextMarkConfig` and swapping the two lead glyphs is the cheap path. String/position themselves are (c) inferred.
 
-**Baidu: could not establish.** No primary or credible secondary source names the exact string or position; it could be `百度AI生成`, `文心一格AI生成`, or product-specific. Harvest the glyphs from corpus positives, not the web.
+**Baidu: RESOLVED 2026-07-22, registered (`baidu_engine.py`).** The mark is a white bold "百度" text run + a separate white rounded tag with dark "AI生成", bottom-right -- settled by the TC260 USCC cohort harvest (16 frames, USCC 91110000802100433B), not by web research. Detection keys on the text run only; details in `docs/module-internals.md`.
 
 **Meta `Imagined with AI` (string VERIFIED (a) from Meta's own newsroom; POSITION NOT VERIFIED).** Sources conflict (bottom-left vs bottom-right) and one claims newer Meta models dropped the visible mark for invisible watermarking; none survived a fetch. Do NOT encode a corner without a corpus sample. Meta also embeds IPTC + invisible watermarks, which `identify` already reads. Source: `https://about.fb.com/news/2024/02/labeling-ai-generated-images-on-facebook-instagram-and-threads/`.
 

@@ -24,6 +24,9 @@ Entries:
   - ``kling`` -- Kuaishou Kling "可灵AI 3.0" text strip, bottom-right.
   - ``samsung`` -- Samsung Galaxy AI "Contenuti generati dall'AI" strip, bottom-left.
   - ``jimeng_pill`` -- Jimeng-basic "AI生成" pill, top-left (capture-less).
+  - ``runninghub`` -- RunningHub "RunningHub AI生成" text, top-left (gray front-end).
+  - ``baidu`` -- Baidu "百度 AI生成" text + white tag, bottom-right.
+  - ``liblib`` -- LibLibAI "LibLibAI" wordmark, bottom-center.
 """
 
 from __future__ import annotations
@@ -88,6 +91,9 @@ _PRODUCT_OF: dict[str, str] = {
     "qwen": "qwen",
     "kling": "kling",
     "samsung": "samsung",
+    "runninghub": "runninghub",
+    "baidu": "baidu",
+    "liblib": "liblib",
 }
 
 
@@ -373,6 +379,18 @@ def _engine(key: str) -> Any:
             from remove_ai_watermarks.pill_engine import PillEngine
 
             _engines[key] = PillEngine()
+        elif key == "runninghub":
+            from remove_ai_watermarks.runninghub_engine import RunningHubEngine
+
+            _engines[key] = RunningHubEngine()
+        elif key == "baidu":
+            from remove_ai_watermarks.baidu_engine import BaiduEngine
+
+            _engines[key] = BaiduEngine()
+        elif key == "liblib":
+            from remove_ai_watermarks.liblib_engine import LibLibEngine
+
+            _engines[key] = LibLibEngine()
         else:  # pragma: no cover - guarded by the registry keys
             raise KeyError(key)
     return _engines[key]
@@ -517,6 +535,9 @@ _REGISTRY: tuple[KnownMark, ...] = (
     _text_mark("qwen", "Qwen 千问AI生成 text", "bottom-right"),
     _text_mark("kling", "Kling 可灵AI 3.0 text", "bottom-right"),
     _text_mark("samsung", "Samsung Galaxy AI text", "bottom-left"),
+    _text_mark("runninghub", "RunningHub AI生成 text", "top-left"),
+    _text_mark("baidu", "Baidu 百度 AI生成 text", "bottom-right"),
+    _text_mark("liblib", "LibLibAI wordmark", "bottom-center"),
     KnownMark("jimeng_pill", "Jimeng AI生成 pill", "top-left", True, _pill_detect, _pill_mask, _pill_features),
 )
 
@@ -597,7 +618,7 @@ def _keep_pill(keys: set[str], *, provenance: frozenset[str], footprint_flat: bo
     Doubao detection; a Qwen image likewise (another vendor's bottom-right mark naming
     its own product), so a confident Qwen detection suppresses the pill the same way.
     No confirmation at all -> never remove (blocks false fires on non-Jimeng content)."""
-    if "doubao" in keys or "qwen" in keys or "kling" in keys:
+    if "doubao" in keys or "qwen" in keys or "kling" in keys or "runninghub" in keys or "baidu" in keys:
         return False
     if "jimeng" in keys:
         return True

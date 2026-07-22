@@ -538,6 +538,12 @@ def main() -> None:
     ap.add_argument("--name", default="", help="label for output files (defaults to the asset stem)")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--scale-basis", choices=("short", "width"), default="short")
+    ap.add_argument(
+        "--corner",
+        choices=("br", "bl", "tl"),
+        default=None,
+        help="override the inherited br corner (e.g. tl for RunningHub)",
+    )
     ap.add_argument("--sheets", action="store_true")
     ap.add_argument(
         "--fit-geometry",
@@ -573,6 +579,8 @@ def main() -> None:
     ):
         if arg is not None:
             overrides[field] = arg
+    if a.corner is not None:
+        overrides["corner"] = a.corner
     if ladder is not None:
         overrides["ladder"] = ladder
 

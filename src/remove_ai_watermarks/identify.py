@@ -449,6 +449,9 @@ _VISIBLE_MARK_PLATFORM = {
     "qwen": "Alibaba Tongyi Qianwen (visible 千问AI生成 mark detected)",
     "kling": "Kuaishou Kling (visible 可灵AI 3.0 mark detected)",
     "samsung": "Samsung Galaxy AI (visible 'Contenuti generati dall'AI' mark detected)",
+    "runninghub": "RunningHub (visible RunningHub AI生成 mark detected)",
+    "baidu": "Baidu (visible 百度 AI生成 mark detected)",
+    "liblib": "LibLibAI (visible LibLibAI mark detected)",
 }
 
 

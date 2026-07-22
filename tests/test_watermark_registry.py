@@ -14,7 +14,18 @@ DOUBAO_SAMPLE = Path(__file__).resolve().parents[1] / "data" / "samples" / "doub
 
 class TestCatalog:
     def test_keys(self):
-        assert reg.mark_keys() == ["gemini", "doubao", "jimeng", "qwen", "kling", "samsung", "jimeng_pill"]
+        assert reg.mark_keys() == [
+            "gemini",
+            "doubao",
+            "jimeng",
+            "qwen",
+            "kling",
+            "samsung",
+            "runninghub",
+            "baidu",
+            "liblib",
+            "jimeng_pill",
+        ]
 
     def test_all_in_auto(self):
         assert all(m.in_auto for m in reg.known_marks())
@@ -43,7 +54,18 @@ class TestScan:
     def test_detect_marks_scans_all(self):
         img = np.zeros((256, 256, 3), np.uint8)
         keys = {d.key for d in reg.detect_marks(img)}
-        assert keys == {"gemini", "doubao", "jimeng", "qwen", "kling", "samsung", "jimeng_pill"}
+        assert keys == {
+            "gemini",
+            "doubao",
+            "jimeng",
+            "qwen",
+            "kling",
+            "samsung",
+            "runninghub",
+            "baidu",
+            "liblib",
+            "jimeng_pill",
+        }
 
     def test_blank_image_no_auto_mark(self):
         dets = reg.detect_marks(np.zeros((256, 256, 3), np.uint8), include_explicit=False)

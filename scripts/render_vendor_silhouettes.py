@@ -127,6 +127,33 @@ MARKS = {
     # max on a diverse clean arm, so registration is a gate pick (0.42) the moment
     # more unique carriers arrive.
     "catlogo_alpha.png": "CATLOGO",  # sentinel: drawn by draw_catlogo(), not font-rendered
+    # RunningHub (ComfyUI platform, USCC 91340100MAEB4N8H76, 73-frame cohort
+    # 2026-07-22): white one-line "RunningHub AI生成" text mark.
+    "runninghub_alpha.png": "RunningHub AI生成",
+    # LibLibAI / 哩布哩布AI (USCC 91110105MACJ6K1C8A, 15-frame cohort): white
+    # "LibLibAI" wordmark with a triangle logo (logo not rendered, logos vary).
+    "liblib_alpha.png": "LibLibAI",
+    # Zhipu Qingyan (USCC 91110108MA01KP2T5U, 7-frame cohort): white bold
+    # "清言·AI生成" with a circular logo (logo not rendered). PARKED 2026-07-22
+    # as a measured negative: on both front-ends the cohort scores 0.34-0.39
+    # against a clean-arm max of 0.34-0.37 -- no separation at any render/box
+    # setting (text-only and logo-composite templates both plateau ~0.34 raw;
+    # the white semi-transparent text on variable backgrounds is the wall).
+    # Silhouette stays as the starting point for a structural/learned lever.
+    "qingyan_alpha.png": "清言·AI生成",
+    # MiniMax / Hailuo (6-frame cohort): "MINIMAX" + "Hailuo AI" latin wordmarks.
+    # PARKED 2026-07-22: only 1 of the 6 cohort frames carries a visible mark --
+    # nothing to calibrate recall against (the xinghui rule). Registration is a
+    # gate pick once more unique carriers arrive.
+    "hailuo_alpha.png": "Hailuo AI",
+    # Baidu (USCC 91110000802100433B, 16-frame cohort): white bold "百度" text
+    # + a separate white rounded tag with dark "AI生成", bottom-right. Detection
+    # keys on the 百度 text run ONLY: a two-component template (text+pill) scored
+    # at clean-arm levels (pill = bright-blob magnet, clean p95 0.45-0.55 vs cohort
+    # ~0.5, no separation on either front-end, 2026-07-22); the text-only silhouette
+    # separates (cohort 0.39-0.65 vs clean max 0.352). The white tag is removed
+    # with the mark because the fill blob covers both bright components.
+    "baidu_alpha.png": "百度",
 }
 
 # Per-mark post-processing for the multi-line / slanted stamps (see render()).
@@ -136,6 +163,15 @@ MARK_OPTS: dict[str, dict[str, Any]] = {
     # tight gap + stroke dilation + shear -0.75 reaches 0.65-0.70 on the same frames,
     # at/above the real-vs-real ceiling (~0.6).
     "yuanbao_alpha.png": {"gap_frac": 0.05, "dilate": 2, "shear": -0.75},
+    # Qingyan's real stamp is a heavier weight than STHeiti Medium -- Hiragino
+    # Sans GB W6 matches the measured stroke (2026-07-22; with Medium the
+    # silhouette aspect came out 0.19 vs the real 0.28 and NCC plateaued ~0.3).
+    "qingyan_alpha.png": {"font": "/System/Library/Fonts/Hiragino Sans GB.ttc", "font_index": 2},
+    # LibLibAI's wordmark is set in an Arial-class grotesque, not STHeiti:
+    # measured 2026-07-22 across 7 candidate fonts, Arial lifts the cohort
+    # positives from 0.31-0.47 to 0.42-0.73 while the full-corpus false-fire arm
+    # DROPS to max 0.398 (generic latin UI text matches the wrong font less).
+    "liblib_alpha.png": {"font": "/System/Library/Fonts/Supplemental/Arial.ttf"},
 }
 
 
@@ -151,16 +187,18 @@ def render(text: str, width: int = 335, opts: dict[str, Any] | None = None) -> n
     gap_frac = float(opts.get("gap_frac", 0.15))
     dilate = int(opts.get("dilate", 0))
     shear_k = float(opts.get("shear", 0.0))
+    font_path = str(opts.get("font", _FONT))
+    font_index = int(opts.get("font_index", 0))
     probe = Image.new("L", (10, 10))
     d0 = ImageDraw.Draw(probe)
     lines = text.split("\n")
     size = 8
     while size < 200:  # grow until the LONGEST line fills the target width
-        f = ImageFont.truetype(_FONT, size)
+        f = ImageFont.truetype(font_path, size, index=font_index)
         if max(d0.textbbox((0, 0), ln, font=f)[2] for ln in lines) >= width * 0.98:
             break
         size += 1
-    font = ImageFont.truetype(_FONT, size)
+    font = ImageFont.truetype(font_path, size, index=font_index)
     boxes = [d0.textbbox((0, 0), ln, font=font) for ln in lines]
     line_h = max(bb[3] - bb[1] for bb in boxes)
     gap = max(1, int(line_h * gap_frac))

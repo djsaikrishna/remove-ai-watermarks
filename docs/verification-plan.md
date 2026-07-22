@@ -742,8 +742,10 @@ priority order:
    against the contamination-guarded clean arm, crossfire against doubao/jimeng. 可灵
    additionally stamps a second mark bottom-LEFT, which no current text-mark config
    expresses (the pill is top-left; a bottom-left CJK mark needs a `corner="bl"` CJK
-   config -- samsung is `bl` but Latin-script and width-based). 星绘/百度 are NOT in the
-   corpus in labelable quantity -- verified, do not hunt them again.
+   config -- samsung is `bl` but Latin-script and width-based). 星绘 is NOT in the
+   corpus in labelable quantity -- verified, do not hunt it again. (百度 WAS found
+   later via the USCC cohort harvest and is registered since 2026-07-22 -- see
+   "The 2026-07-22 vendor round" below.)
 
    **STATUS 2026-07-21 (same day): 可灵 REGISTERED, 元宝 measured and PARKED.**
    * **可灵 (`kling_engine.py`)** -- "可灵AI 3.0" bottom-right, strict-only, gate
@@ -793,6 +795,68 @@ Do NOT restart the sweeps to "check". Their artifacts are on disk and listed und
 to confirm the whole surface still works after a change is
 `uv run python scripts/real_examples_e2e.py` (~2 min, real corpus examples through the real
 CLI) plus `uv run python scripts/robustness_suite.py` (~3 min, adversarial inputs).
+
+### The 2026-07-22 vendor round -- 3 REGISTERED (runninghub / baidu / liblib), 2 parked
+
+A fresh metadata-mining pass over the whole corpus (`data/spaces/_mine_signals.py`)
+found NO new metadata signals (the channel is saturated), so the round worked the
+visible-mark cohorts (`vendor_cohort_harvest.py`, 4606 TC260 carriers / 46 entities).
+Registered, each by the qwen playbook (synthetic silhouette -> measured geometry ->
+clean-arm gate -> crossfire -> full-corpus sweep):
+
+* **RunningHub (`runninghub_engine.py`)** -- "RunningHub AI生成" TOP-LEFT (a new
+  `corner="tl"`), faint mid-gray text. The white top-hat suppresses it to clean-arm
+  levels (positives 0.16-0.23 vs clean p99 0.31), so it introduced the third
+  detection front-end, **`gray`** (raw-grayscale silhouette NCC, contrast-DEPENDENT):
+  positives 0.38-0.54 vs clean max 0.295 -> gate 0.34, strict-only. The NCC comb is
+  razor-sharp in size (0.537 on-size, 0.223 at +5.6%), so the ladder is a tight
+  (0.95, 1.0, 1.05) exactly on the measured 0.32-of-width. Two measured traps with
+  their fixes: (1) the binary blob under-segments the faint head glyphs, so the
+  blob-bbox footprint left "Runni" unremoved -- the gray front-end's footprint is
+  always the detector's own match box; (2) the full-corpus sweep surfaced 37/42009
+  outside-cohort false fires at 0.34-0.38 (hair, shelves, CJK banners) with no NCC
+  separation from the 0.381 positives -- the **anchor gate** (the match must sit at
+  the measured corner, x<=0.025/y<=0.015 of the frame) rejects all 37 at zero
+  positive cost.
+* **Baidu (`baidu_engine.py`)** -- "百度" white bold text + a white rounded tag
+  "AI生成", bottom-right. Detection keys on the 百度 TEXT RUN ONLY: a
+  text+pill template was a measured bright-blob magnet (no separation on either
+  front-end). Gate history, each step measured: 0.37 from the clean arm (max 0.352);
+  the 741-frame eval set then fired 14x outside the cohort and 13 were NOT the
+  vendor (12x 千问 -- 百/千 are near-identical after binarization -- plus one 抖音
+  AI创作 at 0.425), so `rivals=("doubao_alpha.png","qwen_alpha.png")` (both margins
+  load-bearing, zero genuine cost) and the gate moved 0.37 -> 0.43; the full-corpus
+  sweep then put outside-cohort true carriers at 0.50-0.66 vs the false arm max
+  0.47, so the gate settled at **0.48**. Cohort: 7/16 fire (all true). The
+  footprint is custom: the tag's flat white interior gives no top-hat response, so
+  a blob bbox leaves the tag as a ghost -- the mask is the match box extended right
+  to the corner.
+* **LibLibAI (`liblib_engine.py`)** -- triangle logo + "LibLibAI" wordmark
+  **bottom-CENTER** (a new `corner="bc"`). The discriminative lever was the FONT:
+  STHeiti scored the cohort 0.31-0.47 against a false arm (latin UI text bands) at
+  0.50; measured across 7 fonts, **Arial** lifts the cohort to 0.42-0.73 and DROPS
+  the false arm to max 0.398 (generic latin text matches the wrong font less). Gate
+  0.42, strict-only; a per-mark size floor (`_MIN_SHORT_SIDE=480`) backs it (the
+  one remaining false fire was a 200x200 icon on a 20px template). Custom
+  footprint: match box extended left by ~1.3 glyph heights for the triangle logo
+  (the blob bbox both bled into background structure -- ate a shirt's real print --
+  and did not own the logo).
+
+Parked, both as measured negatives with the silhouette kept in
+`render_vendor_silhouettes.py` as the starting point:
+
+* **Zhipu Qingyan (清言·AI生成)** -- 7-frame cohort, white semi-transparent text +
+  swirl logo. On both front-ends the cohort scores 0.34-0.39 vs clean max
+  0.34-0.37 -- no separation at any render/box setting (text-only and
+  logo-composite templates, two CJK fonts). Same wall class as 元宝.
+* **MiniMax / Hailuo AI** -- only 1 of 6 cohort frames carries a visible mark
+  (Hailuo is a video product; the mark is a video-frame stamp). The xinghui rule:
+  nothing registered off a single frame.
+
+The full-corpus sweep harness is `data/spaces/_sweep_new_marks.py` (read-only,
+gitignored); its artifact `_new_marks_sweep.jsonl` records every fire. The sweep
+also proved the outside-cohort value of registration: 6 metadata-STRIPPED true
+Baidu carriers the TC260 cohort cannot see are now detected and cleaned.
 
 ### The 千问 harvest (2026-07-21) -- RESOLVED, registered the same day
 
