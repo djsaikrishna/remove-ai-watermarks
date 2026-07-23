@@ -1,31 +1,31 @@
-"""Inventory AI-provenance signals AND all raw metadata over a dataset.
+"""Collect all raw metadata over a dataset, for later offline analysis.
 
-Read-only. For every image it writes one JSONL record containing:
+Read-only; analysis is NOT this script's job. For every image it writes
+one JSONL record containing:
 
 - file basics: name, path, size in bytes, container format (content-sniffed),
-  pixel dimensions, dpi, color mode, bit depth
-- the library verdict: full `identify` ProvenanceReport (what we detect as AI)
-- raw metadata the library does NOT interpret, so nothing has to be re-run:
+  pixel dimensions, dpi, color mode, sha256, mtime/birthtime
+- raw metadata, so nothing has to be re-scanned later:
   full EXIF (all IFDs, decoded tag names, MakerNote in full hex), all XMP
   packets, all PNG chunks (text chunks decoded and inflated, binary chunks
   as base64), all JPEG APP segments (marker + full base64), WebP RIFF
   chunks, ISOBMFF box/item inventory for HEIC/AVIF/MOV, IPTC-IIM dataset,
   ICC profile (full base64), C2PA manifest store JSON, post-EOI/IEND
-  trailers, EXIF thumbnail (bytes + its own JPEG forensics), JPEG encoder
-  forensics (quant tables, IJG quality estimate, progressive scan script,
-  Huffman tables, subsampling, JFIF/Adobe markers), XMP edit-trail fields
-  (creator tool, history agents/actions/timestamps, namespaces, motion
-  photo / Ultra HDR / depth-map flags), file hashes and timestamps, macOS
+  trailers, EXIF thumbnail (bytes + its own JPEG structure), JPEG encoder
+  structure (quant tables, progressive scan script, Huffman tables,
+  subsampling, JFIF/Adobe markers), file hashes and timestamps, macOS
   download provenance xattrs, Live Photo content identifier. Embedded
   binary blobs are base64'd in full with a 1 MB ceiling per blob.
+
+Everything collected is raw bytes or a mechanical container decode;
+no verdicts, no estimates, no edit-trail interpretation.
 
 Usage:
     python scan_dataset.py /path/to/dataset out_prefix
 
 Writes out_prefix.jsonl (one record per file) and out_prefix.csv (flat
-summary of the detection verdicts only, for quick sorting). If the prefix
-ends with .gz the JSONL is gzip-compressed on the fly (3-5x smaller; still
-streamable line by line).
+summary for quick sorting). If the prefix ends with .gz, the JSONL is
+gzip-compressed on the fly (3-5x smaller, still streamable line by line).
 
 For a large dataset, parallelize by sharding the input into folders and
 running one process per shard (a multiprocessing pool hangs on macOS once
@@ -37,15 +37,15 @@ cv2/PIL are loaded; independent processes do not):
     wait
     cat out_*.jsonl > dataset.jsonl   # or just read the shards lazily
 
+Rerunning with the same prefix resumes: files already present in the
+output are skipped, new files are appended.
+
 Reading big results: never load the JSONL whole. Stream it:
 polars.scan_ndjson (lazy), pandas.read_json(lines=True, chunksize=...),
 or a plain line loop. One line = one self-contained JSON record.
 
-Standalone use (no remove_ai_watermarks checkout):
-    pip install pillow piexif c2pa-python pillow-heif
-pillow-heif is only needed for HEIC/AVIF inputs. Without
-remove_ai_watermarks the record simply carries no AI verdict; everything
-raw is still collected.
+Dependencies: pip install pillow piexif c2pa-python pillow-heif
+(pillow-heif is only needed for HEIC/AVIF inputs).
 """
 
 import base64
@@ -59,16 +59,6 @@ from typing import Any
 
 from PIL import Image
 from PIL.IptcImagePlugin import getiptcinfo
-
-try:
-    from remove_ai_watermarks.identify import identify
-except ImportError:  # standalone mode: raw metadata only, no AI verdict
-    identify = None  # type: ignore[assignment]
-
-try:  # optional reuse of the repo's cached C2PA reader (standalone-safe)
-    from remove_ai_watermarks.noai.c2pa import read_manifest_store_json as _repo_c2pa_reader
-except ImportError:
-    _repo_c2pa_reader = None  # type: ignore[assignment]
 
 SUPPORTED = {
     ".png",
@@ -361,15 +351,7 @@ def read_pil_info(path: Path) -> tuple[dict[str, Any], dict[str, Any], bytes | N
 
 
 def read_c2pa_store(path: Path) -> dict[str, Any]:
-    """Full C2PA manifest store JSON. Prefers the repo's cached Reader
-    wrapper when the package is installed; falls back to a direct
-    c2pa-python Reader call in standalone mode."""
-    if _repo_c2pa_reader is not None:
-        try:
-            store = _repo_c2pa_reader(path)
-            return json.loads(store) if store else {}
-        except Exception as exc:
-            return {"error": _safe_str(exc)}
+    """Full C2PA manifest store JSON via the official c2pa-python Reader."""
     try:
         from c2pa import Reader
 
@@ -386,163 +368,18 @@ def sniff_format(head: bytes) -> str:
         return "jpeg"
     if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
         return "webp"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if head.startswith(b"BM"):
+        return "bmp"
+    if head.startswith((b"II*\x00", b"MM\x00*")):
+        return "tiff"
     if head[4:8] == b"ftyp":
         return f"isobmff:{head[8:12].decode('latin-1', 'replace')}"
     return f"unknown:{head[:16].hex()}"
 
 
 # --- forensic helpers: signals that a file is not an untouched original ---
-
-# IJG/libjpeg base quantization tables (quality 50), Annex K
-_IJG_LUM_Q50 = [
-    16,
-    11,
-    10,
-    16,
-    24,
-    40,
-    51,
-    61,
-    12,
-    12,
-    14,
-    19,
-    26,
-    58,
-    60,
-    55,
-    14,
-    13,
-    16,
-    24,
-    40,
-    57,
-    69,
-    56,
-    14,
-    17,
-    22,
-    29,
-    51,
-    87,
-    80,
-    62,
-    18,
-    22,
-    37,
-    56,
-    68,
-    109,
-    103,
-    77,
-    24,
-    35,
-    55,
-    64,
-    81,
-    104,
-    113,
-    92,
-    49,
-    64,
-    78,
-    87,
-    103,
-    121,
-    120,
-    101,
-    72,
-    92,
-    95,
-    98,
-    112,
-    100,
-    103,
-    99,
-]
-_IJG_CHR_Q50 = [
-    17,
-    18,
-    24,
-    47,
-    99,
-    99,
-    99,
-    99,
-    18,
-    21,
-    26,
-    66,
-    99,
-    99,
-    99,
-    99,
-    24,
-    26,
-    56,
-    99,
-    99,
-    99,
-    99,
-    99,
-    47,
-    66,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-    99,
-]
-
-
-def _ijg_table(quality: int, base: list[int]) -> list[int]:
-    scale = 5000 // quality if quality < 50 else 200 - quality * 2
-    return [max(1, min(255, (b * scale + 50) // 100)) for b in base]
-
-
-def estimate_jpeg_quality(lum_table: list[int]) -> int | None:
-    """Best-fit IJG quality for a luminance quant table, else None if the
-    table does not look IJG-derived (custom encoder, camera-specific)."""
-    best_q, best_err = None, None
-    for q in range(1, 101):
-        ref = _ijg_table(q, _IJG_LUM_Q50)
-        err = sum(abs(a - b) for a, b in zip(lum_table, ref, strict=True))
-        if best_err is None or err < best_err:
-            best_q, best_err = q, err
-    return best_q if best_err is not None and best_err <= 200 else None
 
 
 def _jpeg_forensics_bytes(data: bytes) -> dict[str, Any]:
@@ -630,11 +467,6 @@ def _jpeg_forensics_bytes(data: bytes) -> dict[str, Any]:
             pos += 2 + length
         if dqt:
             out["quant_tables"] = dqt
-            q = estimate_jpeg_quality(dqt.get("0", []))
-            if q is not None:
-                out["estimated_ijg_quality"] = q
-            else:
-                out["ijg_derived"] = False
         if dht:
             out["huffman_tables_hex"] = dht
         if comments:
@@ -645,74 +477,6 @@ def _jpeg_forensics_bytes(data: bytes) -> dict[str, Any]:
     except Exception as exc:
         out["error"] = _safe_str(exc)
     return out
-
-
-def parse_xmp_forensics(xmp_text: str) -> dict[str, Any]:
-    """Edit-trail fields from an XMP packet: creator tool, history events,
-    derived-from. These are the direct 'someone edited this' footprints."""
-    import re
-
-    out: dict[str, Any] = {}
-    if not xmp_text:
-        return out
-    for field, patterns in {
-        "creator_tool": [r'xmp:CreatorTool="([^"]*)"', r"<xmp:CreatorTool>([^<]*)"],
-        "metadata_date": [r'xmp:MetadataDate="([^"]*)"'],
-        "modify_date": [r'xmp:ModifyDate="([^"]*)"'],
-        "derived_from": [r'stRef:documentID="([^"]*)"'],
-        "original_document_id": [r'xmpMM:OriginalDocumentID="([^"]*)"'],
-    }.items():
-        for pat in patterns:
-            m = re.search(pat, xmp_text)
-            if m:
-                out[field] = m.group(1)[:500]
-                break
-    agents = re.findall(r"stEvt:softwareAgent>([^<]*)", xmp_text)
-    actions = re.findall(r"stEvt:action>([^<]*)", xmp_text)
-    whens = re.findall(r"stEvt:when=\"([^\"]*)\"", xmp_text)
-    if agents:
-        out["history_software_agents"] = agents[:20]
-    if actions:
-        out["history_actions"] = actions[:20]
-    if whens:
-        out["history_when"] = whens[:20]
-    # declared namespaces are an editor fingerprint on their own:
-    # crs = Lightroom/Camera Raw (with edit settings attached), photoshop,
-    # xmpG = GIMP, darktable, apple_photos, hdrgm = Ultra HDR, GDepth/GImage/
-    # GCamera = Google computational photography (depth map, motion photo)
-    namespaces = sorted(set(re.findall(r"xmlns:([A-Za-z0-9_]+)=", xmp_text)))
-    if namespaces:
-        out["namespaces"] = namespaces
-    if re.search(r"crs:\w+[=>\s]", xmp_text):
-        out["camera_raw_edited"] = True
-    if "GCamera:MotionPhoto" in xmp_text or "Camera:MotionPhoto" in xmp_text:
-        out["motion_photo"] = True
-        m = re.search(r"MicroVideoOffset[=>\"\s]+(\d+)", xmp_text)
-        if m:
-            out["micro_video_offset"] = int(m.group(1))
-    if "GDepth:" in xmp_text or "GImage:" in xmp_text:
-        out["google_depth_map"] = True
-    if "hdrgm:" in xmp_text:
-        out["ultra_hdr_xmp"] = True
-    return out
-
-
-def xmp_texts_of(record_parts: dict[str, Any]) -> list[str]:
-    """XMP packets, collected only from slots tagged at extraction (the
-    container reader knows it is XMP; no substring guessing)."""
-    texts: list[str] = []
-    for key in ("info:xmp", "info:XML:com.adobe.xmp"):
-        value = record_parts.get("pil", {}).get(key)
-        if isinstance(value, str):
-            texts.append(value)
-    for seg in record_parts.get("jpeg", {}).get("segments", []):
-        if seg.get("kind") == "xmp" and seg.get("text"):
-            texts.append(seg["text"])
-    for slot in ("png_chunks", "webp_chunks"):
-        for chunk in record_parts.get(slot, []):
-            if chunk.get("kind") == "xmp" and chunk.get("text"):
-                texts.append(chunk["text"])
-    return texts
 
 
 def read_webp_chunks(data: bytes) -> list[dict[str, Any]]:
@@ -911,8 +675,8 @@ def scan_file(path: Path) -> dict[str, Any]:
         "content_format": sniff_format(head),
     }
     if oversized:
-        # too big to hold in memory: path-based readers (identify, PIL,
-        # piexif, c2pa) still run; byte-level walkers are skipped
+        # too big to hold in memory: path-based readers (PIL, piexif,
+        # c2pa) still run; byte-level walkers are skipped
         record["oversized"] = {"head_scanned_bytes": len(head)}
     where_from = xattr_where_from(path)
     if where_from:
@@ -923,26 +687,6 @@ def scan_file(path: Path) -> dict[str, Any]:
     live_photo_id = apple_live_photo_id(head[: 2 << 20])
     if live_photo_id:
         record["live_photo_content_id"] = live_photo_id
-    if identify is None:
-        record["verdict"] = {"skipped": "remove_ai_watermarks not installed"}
-    else:
-        try:
-            # visible-mark detectors are cv2-heavy and are the slow part; the
-            # dataset scan only cares about metadata/embedded signals
-            report = identify(path, check_visible=False)
-            record["verdict"] = {
-                "is_ai_generated": report.is_ai_generated,
-                "platform": report.platform,
-                "confidence": report.confidence,
-                "ai_source_kind": report.ai_source_kind,
-                "ai_from_metadata": report.ai_from_metadata,
-                "watermarks": [str(w) for w in report.watermarks],
-                "signals": [str(s) for s in report.signals],
-                "caveats": [str(c) for c in report.caveats],
-                "integrity_clashes": [str(c) for c in report.integrity_clashes],
-            }
-        except Exception as exc:
-            record["verdict"] = {"error": _safe_str(exc)}
     record["pil"], record["iptc"], exif_blob = read_pil_info(path)
     record["exif"], thumbnail = read_full_exif(path, exif_blob)
     record["c2pa_store"] = read_c2pa_store(path)
@@ -959,13 +703,6 @@ def scan_file(path: Path) -> dict[str, Any]:
             record["webp_chunks"] = read_webp_chunks(data)
         elif fmt.startswith("isobmff"):
             record["isobmff"] = read_isobmff_inventory(data)
-    # edit-trail parse over every XMP packet found in any container slot
-    xmp: dict[str, Any] = {}
-    for text in xmp_texts_of(record):
-        for key, value in parse_xmp_forensics(text).items():
-            xmp.setdefault(key, value)
-    if xmp:
-        record["xmp_forensics"] = xmp
     if thumbnail:
         record["has_exif_thumbnail"] = True
         # the embedded thumbnail is its own JPEG; after an edit its encoder
@@ -977,7 +714,6 @@ def scan_file(path: Path) -> dict[str, Any]:
 
 
 def summary_row(record: dict[str, Any]) -> dict[str, Any]:
-    v = record.get("verdict", {})
     pil = record.get("pil", {})
     return {
         "file": record.get("file"),
@@ -988,13 +724,6 @@ def summary_row(record: dict[str, Any]) -> dict[str, Any]:
         "width": pil.get("width"),
         "height": pil.get("height"),
         "dpi": json.dumps(pil.get("dpi")),
-        "is_ai_generated": v.get("is_ai_generated"),
-        "platform": v.get("platform"),
-        "confidence": v.get("confidence"),
-        "ai_source_kind": v.get("ai_source_kind"),
-        "watermarks": "; ".join(v.get("watermarks", [])),
-        "signals": "; ".join(v.get("signals", [])),
-        "integrity_clashes": "; ".join(v.get("integrity_clashes", [])),
     }
 
 
