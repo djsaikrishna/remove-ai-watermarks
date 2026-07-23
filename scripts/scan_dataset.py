@@ -16,8 +16,10 @@ one JSONL record containing:
   download provenance xattrs, Live Photo content identifier. Embedded
   binary blobs are base64'd in full with a 1 MB ceiling per blob.
 
-Everything collected is raw bytes or a mechanical container decode;
-no verdicts, no estimates, no edit-trail interpretation.
+By default everything collected is raw bytes or a mechanical container
+decode; no verdicts, no estimates, no edit-trail interpretation. The
+optional pixel modes add a clearly-separated derived layer (aggregate
+statistics only, still no verdicts).
 
 Usage:
     python scan_dataset.py /path/to/dataset out_prefix [--pixels|--pixels-full]
@@ -121,16 +123,19 @@ def _decode_exif_value(v: Any) -> Any:
     return v
 
 
-def read_full_exif(path: Path, exif_blob: bytes | None = None) -> tuple[dict[str, Any], bytes | None]:
+def read_full_exif(
+    path: Path, exif_blob: bytes | None = None, data: bytes | None = None
+) -> tuple[dict[str, Any], bytes | None]:
     """All EXIF IFDs with decoded tag names (piexif, no re-encode), plus the
     raw embedded-thumbnail bytes for the caller's own thumbnail forensics.
 
     ``exif_blob`` is the PIL-exposed EXIF blob (PNG/WebP/HEIC path) so the
-    caller's single Image.open is not repeated here."""
+    caller's single Image.open is not repeated here. ``data`` is the
+    already-read file bytes so piexif does not re-read the file."""
     import piexif
 
     try:
-        exif = piexif.load(str(path))
+        exif = piexif.load(data) if data is not None else piexif.load(str(path))
     except Exception:
         if not exif_blob:
             return {}, None
@@ -664,7 +669,7 @@ def _sha256_stream(path: Path) -> str:
     return h.hexdigest()
 
 
-def scan_file(path: Path, *, pixels: bool = False, pixels_full: bool = False) -> dict[str, Any]:
+def scan_file(path: Path, *, pixel_mode: str | None = None) -> dict[str, Any]:
     stat = path.stat()
     oversized = stat.st_size > _MAX_FULL_READ
     if oversized:
@@ -698,7 +703,7 @@ def scan_file(path: Path, *, pixels: bool = False, pixels_full: bool = False) ->
     if live_photo_id:
         record["live_photo_content_id"] = live_photo_id
     record["pil"], record["iptc"], exif_blob = read_pil_info(path)
-    record["exif"], thumbnail = read_full_exif(path, exif_blob)
+    record["exif"], thumbnail = read_full_exif(path, exif_blob, data)
     record["c2pa_store"] = read_c2pa_store(path)
     if data is not None:
         fmt = record["content_format"]
@@ -720,14 +725,19 @@ def scan_file(path: Path, *, pixels: bool = False, pixels_full: bool = False) ->
         thumb_forensics = _jpeg_forensics_bytes(thumbnail)
         thumb_forensics["base64"] = _b64(thumbnail)
         record["exif_thumbnail_forensics"] = thumb_forensics
-    if (pixels or pixels_full) and not oversized:
-        record.update(scan_pixels_of(path, full=pixels_full))
+    if pixel_mode is not None:
+        if oversized:
+            # symmetric with the metadata oversized marker: distinguish
+            # "skipped because oversized" from "decode failed" downstream
+            record["pixel"] = {"skipped": "oversized"}
+        else:
+            record.update(scan_pixels_of(path, full=pixel_mode == "full"))
     return record
 
 
 def scan_pixels_of(path: Path, *, full: bool) -> dict[str, Any]:
     """The optional pixel layer for one file (see the pixel-layer section
-    below). Returns {} quietly when numpy is unavailable or decode fails."""
+    below). Returns {"pixel_error": ...} when numpy is unavailable."""
     if np is None:
         return {"pixel_error": "numpy not installed"}
     t0 = time.perf_counter()
@@ -738,7 +748,7 @@ def scan_pixels_of(path: Path, *, full: bool) -> dict[str, Any]:
     gray, rgb, info = read_gray(path)
     record["pixel"] = info
     timing["decode"] = time.perf_counter() - t
-    if gray is not None and rgb is not None:
+    if gray is not None:
         # maps shared between the scalar features and the --pixels-full
         # artifacts, computed once (the JPEG re-save and the sliding-window
         # conv are the two most expensive features in the scan)
@@ -802,14 +812,14 @@ def summary_row(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
-    flags = {a for a in sys.argv[3:] if a.startswith("--")}
-    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags, positional = set(), []
+    for arg in sys.argv[1:]:
+        (flags.add if arg.startswith("--") else positional.append)(arg)
     if len(positional) != 2 or flags - {"--pixels", "--pixels-full"}:
         print(__doc__)
         sys.exit(2)
-    pixels = "--pixels" in flags
-    pixels_full = "--pixels-full" in flags
-    if (pixels or pixels_full) and np is None:
+    pixel_mode = "full" if "--pixels-full" in flags else ("basic" if "--pixels" in flags else None)
+    if pixel_mode is not None and np is None:
         print("pixel modes require numpy: pip install numpy")
         sys.exit(2)
     root, prefix = Path(positional[0]), positional[1]
@@ -843,7 +853,7 @@ def main() -> None:
             writer.writeheader()
         for path_str in files:
             try:
-                record = scan_file(Path(path_str), pixels=pixels, pixels_full=pixels_full)
+                record = scan_file(Path(path_str), pixel_mode=pixel_mode)
             except Exception as exc:  # one corrupt file must not kill the scan
                 record = {"file": path_str, "error": _safe_str(exc)}
             jsonl.write(json.dumps(record, default=str) + "\n")
@@ -854,11 +864,7 @@ def main() -> None:
     print(f"done: {jsonl_name}, {csv_name}")
 
 
-# --- optional pixel layer (--pixels / --pixels-full) ----------------------
-# Aggregate pixel forensics. Default --pixels stores only statistics from
-# which the image CANNOT be reconstructed; --pixels-full adds the
-# privacy-lifting artifacts (phash, thumbnail, coarse ELA/noise/phase maps).
-# numpy is required only when a pixel mode is enabled.
+# --- optional pixel layer (--pixels / --pixels-full), requires numpy ---
 
 try:
     import numpy as np
@@ -878,7 +884,7 @@ def _arr_b64(arr: np.ndarray) -> dict[str, Any]:
     return {
         "shape": list(arr.shape),
         "dtype": str(arr.dtype),
-        "base64": base64.b64encode(arr.tobytes()).decode("ascii"),
+        "base64": _b64(arr.tobytes()),
     }
 
 
@@ -920,7 +926,7 @@ def full_artifacts(
     img.thumbnail((128, 128), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=70)
-    out["thumbnail_jpeg_b64"] = base64.b64encode(buf.getvalue()).decode("ascii")
+    out["thumbnail_jpeg_b64"] = _b64(buf.getvalue())
 
     if ela is not None:
         out["ela_map"] = _arr_b64(_coarse(ela))
@@ -991,8 +997,17 @@ def noise_residual_map(gray: np.ndarray) -> np.ndarray | None:
     if gray.shape[0] < 3 or gray.shape[1] < 3:
         return None
     k = np.array([[-1.0, -1.0, -1.0], [-1.0, 8.0, -1.0], [-1.0, -1.0, -1.0]])
-    win = sliding_window_view(gray, (3, 3))
-    return (win * k).sum(axis=(-1, -2))
+    h, w = gray.shape
+    # k is float64, so the residual is float64 like the unchunked form
+    out = np.empty((h - 2, w - 2), dtype=np.float64)
+    # row-chunked: the (win * k) temp is ~150 MB at 2048px if materialized
+    # whole; per-element 9-tap sums are computed in the same order, so the
+    # result is bit-identical to the unchunked form
+    for y0 in range(0, h - 2, 256):
+        y1 = min(y0 + 256, h - 2)
+        win = sliding_window_view(gray[y0 : y1 + 2], (3, 3))
+        out[y0:y1] = (win * k).sum(axis=(-1, -2))
+    return out
 
 
 def noise_features(residual: np.ndarray) -> dict[str, Any]:
@@ -1017,8 +1032,12 @@ def fft_features(mag: np.ndarray) -> dict[str, Any]:
     """Radial magnitude band energies (no phase) + CFA periodicity peaks."""
     h, w = mag.shape
     cy, cx = h // 2, w // 2
-    yy, xx = np.mgrid[:h, :w]
-    r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    # 1D broadcast instead of an mgrid: saves ~160 MB of int64 temporaries
+    # at 2048px; the squares are exact in float64 (values < 2^53), so band
+    # means are identical to the mgrid form
+    r2y = (np.arange(h, dtype=np.float64) - cy) ** 2
+    r2x = (np.arange(w, dtype=np.float64) - cx) ** 2
+    r = np.sqrt(r2y[:, None] + r2x[None, :])
     r_max = r.max()
     bands = []
     for i in range(_FFT_BANDS):
